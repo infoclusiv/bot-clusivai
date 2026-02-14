@@ -70,8 +70,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(txt, parse_mode="Markdown")
             
     elif action == "DELETE":
-        delete_reminder_by_text(user_id, res.get("message"))
-        await update.message.reply_text(f"🗑 He intentado borrar: {res.get('message')}")
+        search_identifier = res.get("message")
+        try:
+            deleted_count = delete_reminder_by_text(user_id, search_identifier)
+            if deleted_count > 0:
+                await update.message.reply_text(f"🗑️ He eliminado {deleted_count} recordatorio(s) relacionado(s) con '{search_identifier}'.")
+            else:
+                await update.message.reply_text(f"No encontré ningún recordatorio activo que coincida con '{search_identifier}'.")
+        except Exception as e:
+            logging.error(f"Error al borrar recordatorio: {e}")
+            await update.message.reply_text("Hubo un error al intentar borrar el recordatorio.")
         
     elif action == "CHAT":
         # Respuesta directa de la IA (incluyendo preguntas como ¿qué hora es?)

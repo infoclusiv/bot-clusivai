@@ -31,7 +31,11 @@ def process_user_input(text):
 
     Reglas:
     - Si el usuario saluda o pregunta algo general (como "¿qué hora es?"), usa action: "CHAT".
-    - Si quiere guardar un recordatorio, usa action: "CREATE".
+    - Si quiere ver sus recordatorios ("mis recordatorios", "lista", "cuáles tengo"), usa action: "LIST".
+    - Si quiere crear un recordatorio, usa action: "CREATE" con la descripción de la tarea.
+    - Si quiere borrar un recordatorio, usa action: "DELETE" y en el campo "message" extrae SOLO el identificador (ID numérico o palabra clave principal), sin verbos como "borra", "quitar", "elimina", etc.
+      Ejemplo: Si dice "Borra el recordatorio con ID 5" → "message": "5"
+      Ejemplo: Si dice "Elimina la tarea de la leche" → "message": "leche"
     - Responde siempre de forma amable en español.
     """
 

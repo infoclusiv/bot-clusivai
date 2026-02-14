@@ -37,11 +37,20 @@ def get_user_reminders(user_id):
 def delete_reminder_by_text(user_id, search_text):
     conn = get_connection()
     cursor = conn.cursor()
-    # Intenta borrar por ID o por coincidencia de texto
-    cursor.execute('DELETE FROM reminders WHERE user_id = ? AND (id = ? OR message LIKE ?)', 
-                   (user_id, search_text, f"%{search_text}%"))
+    
+    try:
+        # Intenta convertir search_text a ID (entero)
+        reminder_id = int(search_text)
+        cursor.execute('DELETE FROM reminders WHERE user_id = ? AND id = ?', (user_id, reminder_id))
+    except ValueError:
+        # Si no es un ID numérico, busca por palabra clave
+        cursor.execute('DELETE FROM reminders WHERE user_id = ? AND message LIKE ? AND status = "pending"', 
+                       (user_id, f"%{search_text}%"))
+    
+    deleted_count = cursor.rowcount
     conn.commit()
     conn.close()
+    return deleted_count
 
 if __name__ == "__main__":
     init_db()
