@@ -1,0 +1,15 @@
+[Unit]
+Description=Clusivai Web App Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/bot-recordatorios
+ExecStart=/root/bot-recordatorios/venv/bin/python3 server.py
+Restart=always
+RestartSec=10
+EnvironmentFile=/root/bot-recordatorios/.env
+
+[Install]
+WantedBy=multi-user.target

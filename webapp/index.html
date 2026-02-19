@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Reprogramar Recordatorio</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div id="app">
+        <!-- Vista de Calendario -->
+        <div id="calendar-view" style="display: none;">
+            <header>
+                <div class="calendar-nav">
+                    <button id="prev-month">&lt;</button>
+                    <h1 id="current-month-year">Mes Año</h1>
+                    <button id="next-month">&gt;</button>
+                </div>
+                <p>Selecciona un día para ver tus recordatorios</p>
+            </header>
+
+            <div id="calendar-container">
+                <div class="calendar-weekdays">
+                    <div>Lun</div>
+                    <div>Mar</div>
+                    <div>Mié</div>
+                    <div>Jue</div>
+                    <div>Vie</div>
+                    <div>Sáb</div>
+                    <div>Dom</div>
+                </div>
+                <div id="calendar-grid" class="calendar-grid"></div>
+            </div>
+
+            <div id="day-details" class="day-details" style="display: none;">
+                <h2 id="selected-day-label">Recordatorios del día</h2>
+                <div id="reminders-list" class="reminders-list"></div>
+            </div>
+        </div>
+
+        <!-- Vista de Edición (Existente) -->
+        <div id="edit-view">
+            <header>
+                <h1 id="edit-title">Reprogramar</h1>
+                <p id="edit-subtitle">Ajusta los detalles de tu recordatorio</p>
+            </header>
+
+            <main>
+                <div class="input-group">
+                    <label for="message">Mensaje</label>
+                    <textarea id="message" rows="3" placeholder="¿Qué necesitas recordar?"></textarea>
+                </div>
+
+                <div class="row">
+                    <div id="date-group" class="input-group">
+                        <label for="date">Fecha</label>
+                        <input type="date" id="date">
+                    </div>
+                    <div class="input-group">
+                        <label for="time">Hora</label>
+                        <input type="time" id="time">
+                    </div>
+                </div>
+
+                <div id="recurrence-group" class="input-group" style="display: none;">
+                    <label>Repetir los días</label>
+                    <div class="day-selector">
+                        <label class="day-pill"><input type="checkbox" value="MO"> <span>Lun</span></label>
+                        <label class="day-pill"><input type="checkbox" value="TU"> <span>Mar</span></label>
+                        <label class="day-pill"><input type="checkbox" value="WE"> <span>Mié</span></label>
+                        <label class="day-pill"><input type="checkbox" value="TH"> <span>Jue</span></label>
+                        <label class="day-pill"><input type="checkbox" value="FR"> <span>Vie</span></label>
+                        <label class="day-pill"><input type="checkbox" value="SA"> <span>Sáb</span></label>
+                        <label class="day-pill"><input type="checkbox" value="SU"> <span>Dom</span></label>
+                    </div>
+                </div>
+
+                <div id="error-message" class="error" style="display: none;"></div>
+            </main>
+
+            <footer>
+                <button id="save-button">Guardar Cambios</button>
+                <button id="delete-button" class="danger" style="display: none;">Eliminar Recordatorio</button>
+                <button id="cancel-button" class="secondary">Cancelar</button>
+            </footer>
+        </div>
+    </div>
+    <script src="script.js"></script>
+</body>
+
+</html>
