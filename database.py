@@ -23,6 +23,15 @@ def init_db():
             daily_summary_time TEXT DEFAULT '07:45:00'
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
     conn.commit()
     conn.close()
 
@@ -182,6 +191,45 @@ def get_today_reminders(user_id):
     rows = cursor.fetchall()
     conn.close()
     return rows
+
+# --- FUNCIONES DE NOTAS ---
+def create_note(user_id, content):
+    """Crea una nueva nota para el usuario."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('INSERT INTO notes (user_id, content) VALUES (?, ?)', (user_id, content))
+    conn.commit()
+    conn.close()
+
+def get_notes_by_user(user_id):
+    """Retorna todas las notas de un usuario, ordenadas por fecha de creación descendente."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT id, content, created_at, updated_at FROM notes WHERE user_id = ? ORDER BY created_at DESC', (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def update_note(note_id, new_content):
+    """Actualiza el contenido de una nota y su fecha de modificación."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('UPDATE notes SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', (new_content, note_id))
+    success = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return success
+
+def delete_note(note_id):
+    """Elimina una nota por su ID."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM notes WHERE id = ?', (note_id,))
+    success = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return success
+
 
 if __name__ == "__main__":
     init_db()

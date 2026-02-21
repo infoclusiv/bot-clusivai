@@ -4,7 +4,7 @@ import os
 import json
 import requests
 import logging
-from database import update_reminder_by_id, get_user_reminders, delete_reminder_by_id
+from database import update_reminder_by_id, get_user_reminders, delete_reminder_by_id, get_notes_by_user, update_note, delete_note
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -100,6 +100,55 @@ def get_reminders():
 @app.route('/<path:path>')
 def static_files(path):
     return send_from_directory(WEBAPP_DIR, path)
+
+# --- ENDPOINTS DE NOTAS ---
+@app.route('/api/notes', methods=['GET'])
+def get_notes():
+    user_id = request.args.get('user_id')
+    if not user_id:
+        return jsonify({"success": False, "error": "Missing user_id"}), 400
+    try:
+        notes = get_notes_by_user(user_id)
+        notes_list = []
+        for n in notes:
+            notes_list.append({
+                "id": n[0],
+                "content": n[1],
+                "created_at": n[2],
+                "updated_at": n[3]
+            })
+        return jsonify({"success": True, "notes": notes_list})
+    except Exception as e:
+        logging.error(f"Error in GET /api/notes: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/notes/<int:note_id>', methods=['PUT'])
+def edit_note(note_id):
+    data = request.json
+    new_content = data.get('content')
+    if not new_content:
+        return jsonify({"success": False, "error": "Missing content"}), 400
+    try:
+        success = update_note(note_id, new_content)
+        if success:
+            return jsonify({"success": True})
+        else:
+            return jsonify({"success": False, "error": "Nota no encontrada"}), 404
+    except Exception as e:
+        logging.error(f"Error in PUT /api/notes/{note_id}: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/notes/<int:note_id>', methods=['DELETE'])
+def remove_note(note_id):
+    try:
+        success = delete_note(note_id)
+        if success:
+            return jsonify({"success": True})
+        else:
+            return jsonify({"success": False, "error": "Nota no encontrada"}), 404
+    except Exception as e:
+        logging.error(f"Error in DELETE /api/notes/{note_id}: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 if __name__ == '__main__':
     # El servidor corre en el puerto 5000 por defecto

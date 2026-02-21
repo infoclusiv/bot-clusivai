@@ -7,6 +7,7 @@
     --button-text-color: var(--tg-theme-button-text-color, #ffffff);
     --secondary-bg-color: var(--tg-theme-secondary-bg-color, #f4f4f5);
     --border-color: #e0e0e0;
+    --danger-color: #e53935;
 }
 
 body {
@@ -114,7 +115,36 @@ button.secondary {
     color: var(--link-color);
 }
 
-/* Calendar Specific Styles */
+/* ==================== TAB NAVIGATION ==================== */
+.tab-nav {
+    display: flex;
+    gap: 0;
+    background-color: var(--secondary-bg-color);
+    border-radius: 14px;
+    padding: 4px;
+    margin-bottom: 4px;
+}
+
+.tab-btn {
+    flex: 1;
+    padding: 10px 16px;
+    border: none;
+    border-radius: 11px;
+    background-color: transparent;
+    color: var(--hint-color);
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.25s ease;
+}
+
+.tab-btn.active {
+    background-color: var(--button-color);
+    color: var(--button-text-color);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+}
+
+/* ==================== CALENDAR ==================== */
 .calendar-nav {
     display: flex;
     justify-content: space-between;
@@ -303,10 +333,156 @@ button.secondary {
 /* Danger Button */
 button.danger {
     background-color: transparent;
-    color: #e53935;
-    border: 1px solid #e53935;
+    color: var(--danger-color);
+    border: 1px solid var(--danger-color);
 }
 
 button.danger:active {
     background-color: #ffebee;
+}
+
+/* ==================== NOTES VIEW ==================== */
+.notes-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    animation: slideUp 0.3s ease-out;
+}
+
+.note-card {
+    background-color: var(--secondary-bg-color);
+    border-radius: 14px;
+    padding: 16px;
+    border-left: 4px solid var(--link-color);
+    transition: transform 0.15s ease, box-shadow 0.2s ease;
+    animation: slideUp 0.3s ease-out;
+}
+
+.note-card:active {
+    transform: scale(0.98);
+}
+
+.note-content {
+    font-size: 15px;
+    line-height: 1.5;
+    margin-bottom: 10px;
+    word-break: break-word;
+    white-space: pre-wrap;
+}
+
+.note-meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.note-date {
+    font-size: 11px;
+    color: var(--hint-color);
+}
+
+.note-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.note-action-btn {
+    padding: 6px 12px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    background-color: transparent;
+    border: 1px solid var(--border-color);
+    color: var(--text-color);
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.note-action-btn:active {
+    background-color: var(--border-color);
+}
+
+.note-action-btn.delete {
+    color: var(--danger-color);
+    border-color: var(--danger-color);
+}
+
+.note-action-btn.delete:active {
+    background-color: #ffebee;
+}
+
+/* Empty State */
+.empty-state {
+    text-align: center;
+    padding: 40px 20px;
+    color: var(--hint-color);
+    animation: slideUp 0.3s ease-out;
+}
+
+.empty-icon {
+    font-size: 48px;
+    margin-bottom: 12px;
+}
+
+.empty-state p {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-color);
+    margin: 0 0 6px;
+}
+
+.empty-state span {
+    font-size: 14px;
+}
+
+/* ==================== NOTE EDIT MODAL ==================== */
+.note-edit-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: rgba(0, 0, 0, 0.4);
+    display: flex;
+    justify-content: center;
+    align-items: flex-end;
+    z-index: 100;
+    animation: fadeIn 0.2s ease-out;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+.note-edit-modal {
+    background-color: var(--bg-color);
+    width: 100%;
+    max-width: 500px;
+    border-radius: 20px 20px 0 0;
+    padding: 24px;
+    box-sizing: border-box;
+    animation: slideUp 0.3s ease-out;
+}
+
+.note-edit-modal h3 {
+    font-size: 18px;
+    margin: 0 0 16px;
+}
+
+.note-edit-modal textarea {
+    width: 100%;
+    min-height: 100px;
+    resize: vertical;
+    box-sizing: border-box;
+    margin-bottom: 16px;
+}
+
+.note-edit-modal .modal-buttons {
+    display: flex;
+    gap: 10px;
+}
+
+.note-edit-modal .modal-buttons button {
+    flex: 1;
 }

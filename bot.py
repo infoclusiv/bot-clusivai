@@ -10,10 +10,11 @@ from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler
 
-from brain import process_user_input
+from brain import process_user_input, process_notes_query
 from database import (add_reminder, get_user_reminders, get_connection, 
                       delete_reminder_by_text, update_reminder_by_id, 
-                      set_daily_summary, get_users_with_daily_summary, get_today_reminders)
+                      set_daily_summary, get_users_with_daily_summary, get_today_reminders,
+                      create_note, get_notes_by_user)
 
 load_dotenv()
 
@@ -259,6 +260,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         reply_message = f"❌ Error al actualizar el recordatorio: {str(e)}"
                         logging.error(f"UPDATE error en database para usuario {user_id}: {e}", exc_info=True)
             
+        elif action == "CONSULTAR_NOTAS":
+            # Recuperar notas del usuario y hacer segunda llamada al LLM
+            user_notes = get_notes_by_user(user_id)
+            notes_response = process_notes_query(user_text, user_notes, history)
+            reply_message = notes_response if notes_response else "No pude consultar tus notas en este momento."
+            
         elif action == "CHAT":
             # Respuesta directa de la IA (incluyendo preguntas como ¿qué hora es?)
             reply_message = res.get("reply")
@@ -318,6 +325,25 @@ async def post_init(application):
     except Exception as e:
         logging.error(f"Error configurando el botón de menú: {e}")
 
+# --- HANDLER PARA COMANDO /nota ---
+async def nota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Guarda una nota persistente directamente sin pasar por brain.py."""
+    user_id = update.effective_user.id
+    # Extraer texto después de /nota
+    text = update.message.text
+    content = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
+    
+    if not content.strip():
+        await update.message.reply_text(
+            "⚠️ Por favor, escribe lo que deseas guardar después del comando.\n"
+            "Ejemplo: /nota La clave del wifi es ABC123"
+        )
+        return
+    
+    create_note(user_id, content.strip())
+    await update.message.reply_text("✅ Nota guardada correctamente.")
+    logging.info(f"Nota guardada para usuario {user_id}: {content[:50]}...")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 ¡Hola! Soy Clusivai. Puedo chatear contigo y gestionar tus recordatorios. ¡Pruébame!")
 
@@ -338,6 +364,7 @@ if __name__ == '__main__':
     application = ApplicationBuilder().token(telegram_token).post_init(post_init).build()
     
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("nota", nota_command))
     application.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & (~filters.COMMAND), handle_message))
     
     # Programar el revisor cada 60 segundos

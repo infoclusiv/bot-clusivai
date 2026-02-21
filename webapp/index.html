@@ -4,13 +4,19 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Reprogramar Recordatorio</title>
+    <title>Clusivai</title>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <link rel="stylesheet" href="style.css">
 </head>
 
 <body>
     <div id="app">
+        <!-- Barra de Navegación por Tabs -->
+        <nav id="tab-nav" class="tab-nav" style="display: none;">
+            <button class="tab-btn active" data-tab="calendar">📅 Calendario</button>
+            <button class="tab-btn" data-tab="notes">📝 Notas</button>
+        </nav>
+
         <!-- Vista de Calendario -->
         <div id="calendar-view" style="display: none;">
             <header>
@@ -38,6 +44,20 @@
             <div id="day-details" class="day-details" style="display: none;">
                 <h2 id="selected-day-label">Recordatorios del día</h2>
                 <div id="reminders-list" class="reminders-list"></div>
+            </div>
+        </div>
+
+        <!-- Vista de Notas -->
+        <div id="notes-view" style="display: none;">
+            <header>
+                <h1>📝 Mis Notas</h1>
+                <p>Tus notas guardadas con /nota</p>
+            </header>
+            <div id="notes-list" class="notes-list"></div>
+            <div id="notes-empty" class="empty-state" style="display: none;">
+                <div class="empty-icon">📋</div>
+                <p>No tienes notas guardadas</p>
+                <span>Usa <strong>/nota</strong> en el chat para guardar información</span>
             </div>
         </div>
 

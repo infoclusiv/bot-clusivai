@@ -97,7 +97,7 @@ def process_user_input(text, history=None, active_reminders=None):
     
     Debes responder ÚNICAMENTE con un objeto JSON con esta estructura:
     {{
-        "action": "CREATE" | "LIST" | "DELETE" | "UPDATE" | "CHAT" | "SET_SETTING",
+        "action": "CREATE" | "LIST" | "DELETE" | "UPDATE" | "CHAT" | "SET_SETTING" | "CONSULTAR_NOTAS",
         "id": número de ID (solo para UPDATE y SET_SETTING si aplica),
         "setting_name": "nombre del ajuste (solo para SET_SETTING, ej: 'daily_summary')",
         "value": valor del ajuste (ej: true, false, o una hora '07:45:00'),
@@ -139,6 +139,12 @@ def process_user_input(text, history=None, active_reminders=None):
       la acción es UPDATE y el ID debe ser el que aparece en la última alerta del historial.
     - Responde siempre de forma amable en español.
     - IMPORTANTE: Si en el historial existe una pregunta de confirmación o seguimiento, el siguiente mensaje del usuario es una RESPUESTA a esa pregunta, no una nueva acción.
+    
+    NOTAS PERSISTENTES (son DIFERENTES de los recordatorios):
+    - Las NOTAS se guardan con el comando /nota y NO tienen fecha/hora. Son datos que el usuario quiere recordar (contraseñas, datos, ideas, etc.).
+    - Los RECORDATORIOS tienen fecha/hora y generan alertas.
+    - Si el usuario pregunta por información guardada, datos personales, contraseñas, notas, o dice "¿qué notas tengo?", "¿cuál era la clave del wifi?", o cualquier consulta sobre información que pudo haber guardado como nota, usa action: "CONSULTAR_NOTAS".
+    - NO necesitas ningún parámetro extra para CONSULTAR_NOTAS, solo pon: {{"action": "CONSULTAR_NOTAS", "reply": ""}}
     """
 
     headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
@@ -231,4 +237,81 @@ def process_user_input(text, history=None, active_reminders=None):
             except Exception as resp_error:
                 print(f"No se pudo leer respuesta: {resp_error}")
         logger.error(f"Error inesperado procesando IA: {e}", exc_info=True)
+        return None
+
+
+def process_notes_query(user_query, notes_data, history=None):
+    """Genera una respuesta natural del LLM basada en las notas del usuario.
+    
+    Args:
+        user_query: La pregunta original del usuario
+        notes_data: Lista de tuplas (id, content, created_at, updated_at)
+        history: Historial de conversación
+    
+    Returns:
+        String con la respuesta natural, o None si hay error
+    """
+    if not API_KEY or not MODEL:
+        logger.error("API_KEY o MODEL no configurados para process_notes_query")
+        return None
+    
+    # Formatear notas como contexto
+    if notes_data:
+        notes_context = "NOTAS GUARDADAS POR EL USUARIO:\n"
+        for note in notes_data:
+            note_id, content, created_at, updated_at = note
+            notes_context += f"- [Nota #{note_id}] {content} (guardada: {created_at})\n"
+    else:
+        notes_context = "El usuario NO tiene notas guardadas actualmente."
+    
+    system_prompt = f"""Eres 'Clusivai', un asistente personal inteligente.
+El usuario te preguntó algo y necesitas responder basándote en sus notas guardadas.
+
+{notes_context}
+
+Reglas:
+- Responde de forma natural y amable en español.
+- Si el usuario pregunta por algo específico (como una contraseña o dato), busca en las notas y respóndele directamente.
+- Si pide ver todas sus notas, lístalas de forma organizada.
+- Si no tiene notas o no encuentras lo que busca, díselo amablemente y sugiere usar /nota para guardar información.
+- Responde SOLO con texto plano (NO JSON). Tu respuesta se enviará directamente al usuario.
+"""
+    
+    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    if history:
+        messages.extend(history)
+    
+    messages.append({"role": "user", "content": user_query})
+    
+    data = {"model": MODEL, "messages": messages}
+    
+    try:
+        logger.info(f"Enviando consulta de notas a OpenRouter")
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=data,
+            timeout=60
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"Error en API OpenRouter (notas): Status {response.status_code}")
+            return None
+        
+        response_data = response.json()
+        if 'choices' not in response_data or not response_data['choices']:
+            logger.error(f"Respuesta inválida de API (notas): {response_data}")
+            return None
+        
+        content = response_data['choices'][0]['message']['content'].strip()
+        logger.info(f"Respuesta de notas: {content[:100]}...")
+        return content
+        
+    except requests.exceptions.Timeout:
+        logger.error("Timeout en consulta de notas")
+        return None
+    except Exception as e:
+        logger.error(f"Error en process_notes_query: {e}", exc_info=True)
         return None
