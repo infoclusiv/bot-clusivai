@@ -3,7 +3,7 @@ tg.expand();
 
 // Extract params from URL
 const urlParams = new URLSearchParams(window.location.search);
-const userId = urlParams.get('user_id');
+const userId = urlParams.get('user_id') || (tg.initDataUnsafe?.user?.id ? String(tg.initDataUnsafe.user.id) : null);
 const mode = urlParams.get('mode') || 'edit'; // 'edit' or 'calendar'
 const reminderId = urlParams.get('id');
 const initialMessage = urlParams.get('message') || '';
@@ -85,7 +85,7 @@ function showEditForm(message = '', dateTime = '', id = null, recurrence = null)
         saveButton.textContent = id ? "Reprogramar" : "Crear";
         dateGroup.style.display = 'block';
         recurrenceGroup.style.display = 'none';
-        deleteButton.style.display = 'none';
+        deleteButton.style.display = id ? 'block' : 'none';
     }
 
     if (dateTime) {

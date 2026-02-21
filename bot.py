@@ -139,9 +139,16 @@ async def send_daily_summaries(context: ContextTypes.DEFAULT_TYPE):
 
 # --- MANEJADOR DE MENSAJES ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
+    # Intentar obtener el texto del mensaje o de la leyenda (caption) de una imagen/archivo
+    user_text = update.message.text or update.message.caption
     user_id = update.effective_user.id
     
+    if not user_text:
+        # Si no hay texto ni leyenda, pero hay una foto, avisar al usuario
+        if update.message.photo or update.message.document:
+             await update.message.reply_text("He recibido la imagen, pero no veo ninguna instrucción. ¿Qué quieres que haga con ella? (Ej: 'Recuérdame revisar esto mañana')")
+        return
+
     logging.info(f"Mensaje recibido de usuario {user_id}: {user_text}")
     
     await update.message.reply_chat_action("typing")
@@ -175,9 +182,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if action == "CREATE":
             recurrence = res.get("recurrence")
-            add_reminder(user_id, res.get("message"), res.get("date"), recurrence)
+            date_str = res.get("date")
+            add_reminder(user_id, res.get("message"), date_str, recurrence)
             msg_recurrence = f"\n🔁 Recurrencia: {recurrence}" if recurrence else ""
-            reply_message = f"✅ ¡Perfecto! He guardado tu recordatorio:\n\n📍 {res.get('message')}\n📅 {res.get('date')}{msg_recurrence}"
+            
+            # Formatear la fecha para mostrar el día de la semana
+            try:
+                dt_obj = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+                # Crear diccionario de días en español
+                dias = {0: "Lunes", 1: "Martes", 2: "Miércoles", 3: "Jueves", 4: "Viernes", 5: "Sábado", 6: "Domingo"}
+                dia_semana = dias[dt_obj.weekday()]
+                fecha_formateada = f"{dia_semana} {date_str}"
+            except Exception:
+                fecha_formateada = date_str
+            
+            reply_message = f"✅ ¡Perfecto! He guardado tu recordatorio:\n\n📍 {res.get('message')}\n📅 {fecha_formateada}{msg_recurrence}"
             
         elif action == "LIST":
             # Cambiamos para mostrar solo el botón del calendario, no la lista larga de texto
@@ -286,6 +305,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['history'] = []
 
 
+async def post_init(application):
+    """Configura el botón de menú después de que la aplicación haya iniciado."""
+    from telegram import MenuButtonWebApp
+    try:
+        # Configurar el botón de menú para abrir la Web App en modo calendario
+        url = f"{WEBAPP_URL}?mode=calendar"
+        await application.bot.set_chat_menu_button(
+            menu_button=MenuButtonWebApp(text="Calendar", web_app=WebAppInfo(url=url))
+        )
+        logging.info(f"Botón de menú configurado con URL: {url}")
+    except Exception as e:
+        logging.error(f"Error configurando el botón de menú: {e}")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 ¡Hola! Soy Clusivai. Puedo chatear contigo y gestionar tus recordatorios. ¡Pruébame!")
 
@@ -303,10 +335,10 @@ if __name__ == '__main__':
     init_db()
     logging.info("Base de datos inicializada correctamente")
     
-    application = ApplicationBuilder().token(telegram_token).build()
+    application = ApplicationBuilder().token(telegram_token).post_init(post_init).build()
     
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    application.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & (~filters.COMMAND), handle_message))
     
     # Programar el revisor cada 60 segundos
     job_queue = application.job_queue

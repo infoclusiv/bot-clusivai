@@ -4,7 +4,7 @@ import json
 import pytz
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -45,7 +45,21 @@ def process_user_input(text, history=None, active_reminders=None):
     
     # Obtener hora actual de Bogotá
     tz_bogota = pytz.timezone('America/Bogota')
-    now = datetime.now(tz_bogota).strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(tz_bogota)
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Generar Mini-Calendario (Hoy + 14 días)
+    # Esto ayuda a la IA a aterrizar "el sábado 21" a una fecha real sin calcular
+    mini_calendar = []
+    dias_espanol = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+    
+    for i in range(15):
+        future_date = now + timedelta(days=i)
+        day_name = dias_espanol[future_date.weekday()]
+        date_iso = future_date.strftime("%Y-%m-%d")
+        mini_calendar.append(f"- {day_name} {date_iso}")
+    
+    mini_calendar_str = "\n".join(mini_calendar)
     
     # Preparar contexto de recordatorios activos
     reminders_context = ""
@@ -59,12 +73,22 @@ def process_user_input(text, history=None, active_reminders=None):
 
     system_prompt = f"""
     Eres 'Clusivai', un asistente personal inteligente. 
-    CONTEXTO IMPORTANTE:
-    - Hora actual en Bogotá, Colombia: {now}.
-    - Si el usuario te pide algo para "mañana", "luego" o "en X minutos", calcula la fecha exacta basándote en la hora de Bogotá que te di.
+    CONTEXTO CALENDARIO (ÚSALO COMO VERDAD ABSOLUTA PARA FECHAS):
+    Hora actual en Bogotá: {now_str}
+    
+    PRÓXIMOS DÍAS (Mini-Calendario):
+    {mini_calendar_str}
+    
+    - Si el usuario dice "el sábado 21", BUSCA en la lista de arriba qué día dice "Sábado ...-21" y usa ESA fecha exacta.
+    - Si el usuario dice "mañana", toma la fecha del segundo renglón del calendario.
+    - Si el usuario dice "el próximo viernes", busca el primer Viernes que aparezca en la lista (o el segundo si hoy es viernes y se refiere al siguiente).
     - TIENES ACCESO AL HISTORIAL DE CONVERSACIÓN. Úsalo para entender el contexto y resolver ambigüedades.
     
     {reminders_context}
+    
+    REGLA DE ORO SOBRE FECHAS:
+    - NO calcules fechas mentalmente si puedes buscarlas en el Mini-Calendario.
+    - Si el usuario menciona un día de la semana y un número (ej: "Lunes 4"), VERIFICA en el calendario que coincidan. Si en el calendario el día 4 es Martes, CORRIGE o usa la fecha del calendario que tenga sentido (prioriza el número si es específico).
     
     REGLA DE ORO SOBRE IDs:
     - Cuando el usuario quiera ACTUALIZAR, BORRAR o PREGUNTAR por un recordatorio, utiliza EXCLUSIVAMENTE los IDs listados arriba en 'RECORDATORIOS ACTIVOS ACTUALES'.
@@ -140,7 +164,7 @@ def process_user_input(text, history=None, active_reminders=None):
             "https://openrouter.ai/api/v1/chat/completions", 
             headers=headers, 
             json=data,
-            timeout=30  # Timeout de 30 segundos
+            timeout=60  # Aumentado a 60 segundos debido a lentitud en modelos gratuitos
         )
         
         # Verificar si la respuesta fue exitosa
@@ -190,7 +214,7 @@ def process_user_input(text, history=None, active_reminders=None):
         return parsed_result
             
     except requests.exceptions.Timeout:
-        logger.error("Timeout al conectar con OpenRouter (30s)")
+        logger.error("Timeout al conectar con OpenRouter (60s)")
         return None
     except requests.exceptions.RequestException as re:
         logger.error(f"Error de conexión con OpenRouter: {re}")
