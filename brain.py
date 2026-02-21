@@ -4,6 +4,7 @@ import json
 import pytz
 import logging
 import re
+import base64
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -11,6 +12,7 @@ load_dotenv()
 
 API_KEY = os.getenv("OPENROUTER_API_KEY")
 MODEL = os.getenv("MODEL_NAME")
+VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"
 
 # Configurar logging para este módulo
 logger = logging.getLogger(__name__)
@@ -237,6 +239,180 @@ def process_user_input(text, history=None, active_reminders=None):
             except Exception as resp_error:
                 print(f"No se pudo leer respuesta: {resp_error}")
         logger.error(f"Error inesperado procesando IA: {e}", exc_info=True)
+        return None
+
+
+def process_vision_input(text, image_base64, history=None, active_reminders=None):
+    """Procesa mensajes con imágenes usando el modelo de visión.
+    
+    Args:
+        text: Texto del usuario (puede ser caption o instrucción posterior)
+        image_base64: Imagen codificada en base64 (formato: data:image/jpeg;base64,...)
+        history: Historial de conversación
+        active_reminders: Recordatorios activos del usuario
+    
+    Returns:
+        Dict con la respuesta parseada o None si hay error
+    """
+    if not API_KEY:
+        logger.error("ERROR: OPENROUTER_API_KEY no está configurado")
+        return None
+    if not VISION_MODEL:
+        logger.error("ERROR: VISION_MODEL no está configurado")
+        return None
+    
+    # Obtener hora actual de Bogotá
+    tz_bogota = pytz.timezone('America/Bogota')
+    now = datetime.now(tz_bogota)
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Generar Mini-Calendario
+    mini_calendar = []
+    dias_espanol = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+    
+    for i in range(15):
+        future_date = now + timedelta(days=i)
+        day_name = dias_espanol[future_date.weekday()]
+        date_iso = future_date.strftime("%Y-%m-%d")
+        mini_calendar.append(f"- {day_name} {date_iso}")
+    
+    mini_calendar_str = "\n".join(mini_calendar)
+    
+    # Preparar contexto de recordatorios activos
+    reminders_context = ""
+    if active_reminders:
+        reminders_context = "\nRECORDATORIOS ACTIVOS ACTUALES DEL USUARIO (Fuente de Verdad):\n"
+        for r in active_reminders:
+            recur_info = f" [Recurrente: {r[3]}]" if len(r) > 3 and r[3] else ""
+            reminders_context += f"- ID {r[0]}: \"{r[1]}\" para el {r[2]}{recur_info}\n"
+    else:
+        reminders_context = "\nEl usuario no tiene recordatorios activos actualmente.\n"
+
+    # Prompt del sistema para el modelo de visión
+    system_prompt = f"""
+    Eres 'Clusivai', un asistente personal inteligente con capacidad de ver imágenes.
+    CONTEXTO CALENDARIO (ÚSALO COMO VERDAD ABSOLUTA PARA FECHAS):
+    Hora actual en Bogotá: {now_str}
+    
+    PRÓXIMOS DÍAS (Mini-Calendario):
+    {mini_calendar_str}
+    
+    {reminders_context}
+    
+    IMPORTANTE: Cuando analices una imagen, haz lo siguiente:
+    1. Describe brevemente qué ves en la imagen (si es relevante para la tarea)
+    2. Si el usuario pide crear un recordatorio basado en la imagen, extrae la información relevante
+    3. Si la imagen contiene texto (captura de pantalla, documento, nota), transcríbelo
+    
+    Debes responder ÚNICAMENTE con un objeto JSON con esta estructura:
+    {{
+        "action": "CREATE" | "LIST" | "DELETE" | "UPDATE" | "CHAT" | "SET_SETTING" | "CONSULTAR_NOTAS",
+        "id": número de ID (solo para UPDATE y SET_SETTING si aplica),
+        "setting_name": "nombre del ajuste (solo para SET_SETTING)",
+        "value": valor del ajuste (ej: true, false, o una hora '07:45:00'),
+        "message": "descripción de la tarea (solo para recordatorios)",
+        "date": "YYYY-MM-DD HH:MM:SS" (fecha calculada para CREATE o UPDATE),
+        "recurrence": "cadena RRULE (solo si es recurrente) o null",
+        "reply": "Tu respuesta directa si la acción es CHAT o confirmación de acción"
+    }}
+
+    Reglas para crear recordatorios desde imágenes:
+    - Si el usuario dice "recuérdame esto", "guarda esto", o algo similar, crea un recordatorio con action: "CREATE"
+    - La descripción del recordatorio debe incluir lo que vez en la imagen (texto, información relevante, etc.)
+    - Si no hay instrucción clara pero hay una imagen, pregunta al usuario qué quiere hacer con ella
+    
+    Ejemplos:
+    - Usuario envía imagen de una factura con texto "Pagar el 15" → CREATE con message: "Pagar factura (texto de imagen: [contenido])"
+    - Usuario envía imagen y dice "recuérdame revisar esto mañana" → CREATE con message basado en la imagen
+    """
+
+    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    
+    # Construir mensaje con contenido multimodal (texto + imagen)
+    user_content = [
+        {"type": "text", "text": text},
+        {"type": "image_url", "image_url": {"url": image_base64}}
+    ]
+    
+    messages = [
+        {"role": "system", "content": system_prompt}
+    ]
+    
+    # Extender con historial si existe (solo mensajes de texto para evitar problemas)
+    if history:
+        for msg in history:
+            if isinstance(msg.get("content"), str):
+                messages.append(msg)
+    
+    # Agregar mensaje actual con imagen
+    messages.append({"role": "user", "content": user_content})
+    
+    data = {
+        "model": VISION_MODEL,
+        "messages": messages
+    }
+
+    try:
+        logger.info(f"Enviando request a OpenRouter con imagen usando modelo: {VISION_MODEL}")
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions", 
+            headers=headers, 
+            json=data,
+            timeout=90  # Más tiempo para modelos de visión
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"Error en API OpenRouter (visión): Status {response.status_code}, Response: {response.text}")
+            return None
+        
+        response_data = response.json()
+        
+        if 'choices' not in response_data or not response_data['choices']:
+            logger.error(f"Respuesta de API inválida (visión): {response_data}")
+            return None
+        
+        content = response_data['choices'][0]['message']['content']
+        logger.info(f"Respuesta cruda de IA (visión): {content[:200]}...")
+        
+        # Limpieza de formato markdown
+        content = content.replace("```json", "").replace("```", "").strip()
+        
+        # Intentar parsear el JSON
+        parsed_result = None
+        
+        try:
+            parsed_result = json.loads(content)
+            logger.info(f"JSON parseado exitosamente (visión): {parsed_result.get('action', 'UNKNOWN')}")
+        except json.JSONDecodeError:
+            logger.warning(f"Parseo directo falló (visión), intentando extracción...")
+            parsed_result = extract_json_from_text(content)
+            if parsed_result:
+                logger.info(f"JSON extraído con regex (visión): {parsed_result.get('action', 'UNKNOWN')}")
+        
+        if parsed_result is None:
+            logger.error(f"No se pudo parsear JSON (visión). Contenido: {content[:200]}...")
+            return None
+        
+        # Validación adicional: asegurar que 'id' sea integer si existe
+        if 'id' in parsed_result and parsed_result['id'] is not None:
+            try:
+                parsed_result['id'] = int(parsed_result['id'])
+            except (ValueError, TypeError):
+                logger.warning(f"ID no es un número válido: {parsed_result['id']}")
+        
+        return parsed_result
+            
+    except requests.exceptions.Timeout:
+        logger.error("Timeout al conectar con OpenRouter (visión) (90s)")
+        return None
+    except requests.exceptions.RequestException as re:
+        logger.error(f"Error de conexión con OpenRouter (visión): {re}")
+        return None
+    except Exception as e:
+        print(f"--- ERROR CRÍTICO EN PROCESS_VISION_INPUT ---")
+        print(f"Tipo de error: {type(e).__name__}")
+        print(f"Mensaje: {e}")
+        logger.error(f"Error inesperado procesando visión: {e}", exc_info=True)
         return None
 
 

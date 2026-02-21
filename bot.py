@@ -4,13 +4,15 @@ import json
 import pytz
 import logging
 import json
+import base64
+import requests
 from datetime import datetime
 from dateutil import rrule
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler
 
-from brain import process_user_input, process_notes_query
+from brain import process_user_input, process_notes_query, process_vision_input
 from database import (add_reminder, get_user_reminders, get_connection, 
                       delete_reminder_by_text, update_reminder_by_id, 
                       set_daily_summary, get_users_with_daily_summary, get_today_reminders,
@@ -19,6 +21,8 @@ from database import (add_reminder, get_user_reminders, get_connection,
 load_dotenv()
 
 WEBAPP_URL = os.getenv("WEBAPP_URL")
+VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"
+DEFAULT_MODEL = os.getenv("MODEL_NAME")
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
@@ -138,19 +142,87 @@ async def send_daily_summaries(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error(f"Error enviando resumen diario a {user_id}: {e}")
 
+# --- FUNCIÓN AUXILIAR: Descargar imagen de Telegram y convertir a base64 ---
+async def download_image_to_base64(update: Update) -> str | None:
+    """Descarga la imagen de un mensaje de Telegram y la convierte a base64.
+    
+    Returns:
+        String con la imagen en formato data:image/jpeg;base64,... o None si falla
+    """
+    try:
+        # Obtener la foto (tomar la última que es la de mayor resolución)
+        photo = update.message.photo[-1] if update.message.photo else None
+        
+        if not photo:
+            # Intentar con documento
+            document = update.message.document
+            if document:
+                # Verificar si es una imagen
+                if document.mime_type and document.mime_type.startswith('image/'):
+                    photo = document
+                else:
+                    return None
+            else:
+                return None
+        
+        # Descargar la imagen
+        bot = update.message.bot
+        file = await bot.get_file(photo.file_id)
+        
+        # Descargar el contenido
+        image_content = await file.download_as_bytearray()
+        
+        # Determinar el tipo MIME
+        mime_type = "image/jpeg"
+        if photo == update.message.document:
+            # Es un documento
+            mime_type = photo.mime_type or "image/jpeg"
+        elif hasattr(photo, 'mime_type') and photo.mime_type:
+            mime_type = photo.mime_type
+        
+        # Convertir a base64
+        image_base64 = base64.b64encode(image_content).decode('utf-8')
+        
+        # Retornar en formato data URI
+        return f"data:{mime_type};base64,{image_base64}"
+        
+    except Exception as e:
+        logging.error(f"Error descargando imagen: {e}")
+        return None
+
 # --- MANEJADOR DE MENSAJES ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Intentar obtener el texto del mensaje o de la leyenda (caption) de una imagen/archivo
     user_text = update.message.text or update.message.caption
     user_id = update.effective_user.id
     
-    if not user_text:
-        # Si no hay texto ni leyenda, pero hay una foto, avisar al usuario
-        if update.message.photo or update.message.document:
-             await update.message.reply_text("He recibido la imagen, pero no veo ninguna instrucción. ¿Qué quieres que haga con ella? (Ej: 'Recuérdame revisar esto mañana')")
+    # Verificar si hay una imagen adjunta
+    has_image = update.message.photo or (update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith('image/'))
+    
+    if not user_text and not has_image:
+        # Si no hay texto ni imagen, salir
         return
-
-    logging.info(f"Mensaje recibido de usuario {user_id}: {user_text}")
+    
+    if not user_text and has_image:
+        # Hay imagen pero no hay texto - guardamos la imagen para el siguiente mensaje
+        image_base64 = await download_image_to_base64(update)
+        if image_base64:
+            # Guardar la imagen en el estado del usuario para usarla con el siguiente mensaje de texto
+            context.user_data['pending_image'] = image_base64
+            await update.message.reply_text("📷 He recibido tu imagen. Ahora dime qué quieres que haga con ella. (Ej: 'Recuérdame revisar esto mañana')")
+        else:
+            await update.message.reply_text("No pude procesar la imagen. ¿Puedes intentar de nuevo?")
+        return
+    
+    # Si hay texto y el usuario había enviado una imagen previamente (sin caption)
+    # usar esa imagen junto con el texto actual
+    pending_image = context.user_data.get('pending_image')
+    
+    # Limpiar la imagen pendiente después de usarla
+    if pending_image:
+        del context.user_data['pending_image']
+    
+    logging.info(f"Mensaje recibido de usuario {user_id}: {user_text} (con imagen: {bool(pending_image or has_image)})")
     
     await update.message.reply_chat_action("typing")
     
@@ -165,8 +237,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Obtener recordatorios activos para contexto
     active_reminders = get_user_reminders(user_id)
     
-    # La IA analiza el texto con contexto de historial y recordatorios activos
-    res = process_user_input(user_text, history=history, active_reminders=active_reminders)
+    # Determinar si usamos el modelo de visión o el normal
+    if pending_image or has_image:
+        # Descargar imagen si no la tenemos pendiente
+        if not pending_image and has_image:
+            image_base64 = await download_image_to_base64(update)
+        else:
+            image_base64 = pending_image
+        
+        if image_base64:
+            logging.info(f"Usando modelo de visión para usuario {user_id}")
+            res = process_vision_input(user_text, image_base64, history=history, active_reminders=active_reminders)
+        else:
+            # Fallback al modelo normal si falla la descarga
+            logging.warning(f"Fallo al descargar imagen, usando modelo normal para usuario {user_id}")
+            res = process_user_input(user_text, history=history, active_reminders=active_reminders)
+    else:
+        # La IA analiza el texto con contexto de historial y recordatorios activos
+        res = process_user_input(user_text, history=history, active_reminders=active_reminders)
     
     if not res:
         logging.error(f"process_user_input retornó None para usuario {user_id}")
