@@ -12,11 +12,12 @@ from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler
 
-from brain import process_user_input, process_notes_query, process_vision_input
+from brain import process_user_input, process_notes_query, process_vision_input, process_video_summary
 from database import (add_reminder, get_user_reminders, get_connection, 
                       delete_reminder_by_text, update_reminder_by_id, 
                       set_daily_summary, get_users_with_daily_summary, get_today_reminders,
                       create_note, get_notes_by_user)
+from video_handler import extract_x_url, download_audio, transcribe_audio, cleanup_audio
 
 load_dotenv()
 
@@ -198,11 +199,187 @@ async def download_image_to_base64(update: Update) -> str | None:
         logging.error(f"Error descargando imagen: {e}")
         return None
 
+# --- PROCESAMIENTO DE VIDEOS DE X.COM ---
+async def process_x_video(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, user_text: str):
+    """Pipeline completo: descarga audio → transcribe → analiza → responde.
+    
+    Args:
+        update: Update de Telegram
+        context: Contexto del bot
+        url: URL del tweet/post de X.com
+        user_text: Texto completo del mensaje del usuario
+    """
+    user_id = update.effective_user.id
+    audio_path = None
+    
+    logging.info(f"Procesando video de X.com para usuario {user_id}: {url}")
+    
+    # Inicializar historial si no existe
+    if 'history' not in context.user_data:
+        context.user_data['history'] = []
+    
+    history = context.user_data.get('history', [])
+    
+    try:
+        # ── PASO 1: Descargar audio ──
+        status_msg = await update.message.reply_text("⏳ Descargando audio del video de X...")
+        
+        audio_result, info_or_error = download_audio(url)
+        
+        if audio_result is None:
+            # info_or_error contiene el mensaje de error
+            await status_msg.edit_text(f"❌ {info_or_error}")
+            return
+        
+        audio_path = audio_result
+        video_info = info_or_error  # En caso de éxito, es el dict con info del video
+        
+        # Mostrar info del video si está disponible
+        duration_str = ""
+        if video_info.get('duration'):
+            mins = int(video_info['duration']) // 60
+            secs = int(video_info['duration']) % 60
+            duration_str = f" ({mins}:{secs:02d})"
+        
+        # ── PASO 2: Transcribir audio ──
+        await status_msg.edit_text(f"🎙️ Transcribiendo audio{duration_str}...")
+        
+        transcript, error = transcribe_audio(audio_path)
+        
+        if transcript is None:
+            await status_msg.edit_text(f"❌ {error}")
+            return
+        
+        # ── PASO 3: Analizar con LLM ──
+        await status_msg.edit_text("🧠 Analizando contenido del video...")
+        
+        # Extraer instrucción del usuario (quitar la URL del texto)
+        user_instruction = user_text.replace(url, '').strip()
+        # Limpiar instrucciones vacías o solo con espacios/signos
+        if user_instruction and len(user_instruction.strip('., ')) < 3:
+            user_instruction = None
+        
+        summary = process_video_summary(transcript, user_instruction or None, history)
+        
+        # ── PASO 4: Enviar resultado ──
+        await status_msg.delete()
+        
+        if summary:
+            # Construir respuesta final
+            header = "🎬 **Análisis del video de X.com**\n"
+            if video_info.get('uploader') and video_info['uploader'] != 'Desconocido':
+                header += f"👤 _{video_info['uploader']}_"
+                if duration_str:
+                    header += f" • ⏱️ {duration_str.strip(' ()')}"
+                header += "\n"
+            header += "\n"
+            
+            response_text = header + summary
+        else:
+            # Fallback: si el LLM falla, enviar la transcripción directamente
+            response_text = (
+                "⚠️ No pude generar el análisis automático. "
+                "Aquí tienes la transcripción del video:\n\n"
+                f"📝 _{transcript[:3000]}_"
+            )
+            if len(transcript) > 3000:
+                response_text += "\n\n_(Transcripción truncada)_"
+        
+        # Enviar respuesta (manejar mensajes largos)
+        if len(response_text) > 4096:
+            # Dividir en chunks respetando el límite de Telegram
+            chunks = split_message(response_text, 4096)
+            for chunk in chunks:
+                await update.message.reply_text(chunk, parse_mode="Markdown")
+        else:
+            try:
+                await update.message.reply_text(response_text, parse_mode="Markdown")
+            except Exception:
+                # Si falla el Markdown, enviar sin formato
+                await update.message.reply_text(response_text.replace('*', '').replace('_', ''))
+        
+        # ── Actualizar historial de conversación ──
+        # Guardar contexto del video para que el usuario pueda hacer preguntas de seguimiento
+        context.user_data['history'].append({
+            "role": "user", 
+            "content": f"[Compartí un video de X.com: {url}]. {user_instruction or 'Analízalo.'}"
+        })
+        
+        # Guardar el transcript en el historial (truncado) para preguntas de seguimiento
+        assistant_context = {
+            "action": "VIDEO_ANALYSIS",
+            "url": url,
+            "transcript": transcript[:2000],  # Truncar para no llenar el historial
+            "summary": (summary or "No disponible")[:1000],
+            "reply": summary or "Transcripción enviada directamente."
+        }
+        context.user_data['history'].append({
+            "role": "assistant", 
+            "content": json.dumps(assistant_context, ensure_ascii=False)
+        })
+        
+        # Podar historial
+        max_history_length = 16
+        if len(context.user_data['history']) > max_history_length:
+            context.user_data['history'] = context.user_data['history'][-max_history_length:]
+        
+        logging.info(f"Video de X.com procesado exitosamente para usuario {user_id}")
+        
+    except Exception as e:
+        logging.error(f"Error procesando video de X.com para usuario {user_id}: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(
+                "❌ Hubo un error inesperado procesando el video. Intenta de nuevo."
+            )
+        except Exception:
+            pass
+    
+    finally:
+        # Siempre limpiar archivos temporales
+        if audio_path:
+            cleanup_audio(audio_path)
+
+
+def split_message(text, max_length=4096):
+    """Divide un texto largo en chunks que respeten el límite de Telegram.
+    
+    Intenta cortar en saltos de línea para no romper oraciones.
+    """
+    if len(text) <= max_length:
+        return [text]
+    
+    chunks = []
+    while text:
+        if len(text) <= max_length:
+            chunks.append(text)
+            break
+        
+        # Buscar el último salto de línea dentro del límite
+        cut_point = text.rfind('\n', 0, max_length)
+        if cut_point == -1 or cut_point < max_length // 2:
+            # Si no hay salto de línea conveniente, cortar en espacio
+            cut_point = text.rfind(' ', 0, max_length)
+        if cut_point == -1:
+            cut_point = max_length
+        
+        chunks.append(text[:cut_point])
+        text = text[cut_point:].lstrip()
+    
+    return chunks
+
 # --- MANEJADOR DE MENSAJES ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Intentar obtener el texto del mensaje o de la leyenda (caption) de una imagen/archivo
     user_text = update.message.text or update.message.caption
     user_id = update.effective_user.id
+    
+    # ── DETECCIÓN DE VIDEO DE X.COM ──
+    # Verificar si el mensaje contiene una URL de X.com/Twitter ANTES de cualquier otro procesamiento
+    if user_text:
+        x_url = extract_x_url(user_text)
+        if x_url:
+            await process_x_video(update, context, x_url, user_text)
+            return
     
     # Verificar si hay una imagen adjunta
     has_image = update.message.photo or (update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith('image/'))

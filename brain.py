@@ -497,3 +497,103 @@ Reglas:
     except Exception as e:
         logger.error(f"Error en process_notes_query: {e}", exc_info=True)
         return None
+
+def process_video_summary(transcript, user_instruction=None, history=None):
+    """Analiza y resume la transcripción de un video usando el LLM de OpenRouter.
+    
+    Args:
+        transcript: Texto transcrito del video.
+        user_instruction: Instrucción adicional del usuario (ej: "¿de qué hablan?").
+        history: Historial de conversación.
+    
+    Returns:
+        String con el resumen/análisis, o None si hay error.
+    """
+    if not API_KEY or not MODEL:
+        logger.error("API_KEY o MODEL no configurados para process_video_summary")
+        return None
+    
+    # Truncar transcript si es muy largo para no exceder límites del modelo
+    max_transcript_chars = 15000  # ~3750 tokens aprox
+    truncated = False
+    if len(transcript) > max_transcript_chars:
+        transcript = transcript[:max_transcript_chars]
+        truncated = True
+    
+    system_prompt = """Eres 'Clusivai', un asistente personal inteligente.
+El usuario compartió un video de X.com (Twitter) y se ha transcrito automáticamente su audio.
+
+Tu tarea es analizar la transcripción y proporcionar:
+
+1. 📋 **Resumen**: Un resumen conciso y claro del contenido del video (2-4 oraciones).
+2. 🔑 **Puntos clave**: Los puntos o ideas principales mencionados (lista con bullets).
+3. 💡 **Datos relevantes**: Si hay nombres, cifras, fechas, o datos importantes, menciónalos.
+
+Reglas:
+- Responde en español, de forma clara y bien organizada.
+- Usa emojis para hacer la respuesta visual y agradable.
+- Si la transcripción tiene errores de reconocimiento de voz (palabras mal escritas, fragmentos inconexos), haz tu mejor esfuerzo para interpretar el contenido.
+- Si el usuario hizo una pregunta específica sobre el video, enfócate en responderla ADEMÁS del resumen.
+- Si la transcripción parece ser música, letra de canción, o contenido no hablado, indícalo.
+- Responde SOLO con texto plano formateado (NO JSON). Tu respuesta se enviará directamente al usuario.
+- No incluyas la transcripción completa en tu respuesta, solo el análisis.
+"""
+
+    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    # Agregar historial relevante (solo los últimos mensajes para contexto)
+    if history:
+        # Limitar historial para no exceder el contexto del modelo
+        recent_history = history[-6:] if len(history) > 6 else history
+        for msg in recent_history:
+            if isinstance(msg.get("content"), str):
+                messages.append(msg)
+    
+    # Construir mensaje del usuario con la transcripción
+    user_content = "TRANSCRIPCIÓN DEL VIDEO DE X.COM:\n"
+    user_content += "─" * 40 + "\n"
+    user_content += transcript
+    user_content += "\n" + "─" * 40
+    
+    if truncated:
+        user_content += "\n⚠️ (La transcripción fue truncada por ser muy larga. Analiza lo disponible.)"
+    
+    if user_instruction:
+        user_content += f"\n\nINSTRUCCIÓN DEL USUARIO: {user_instruction}"
+    
+    messages.append({"role": "user", "content": user_content})
+    
+    data = {"model": MODEL, "messages": messages}
+    
+    try:
+        logger.info(f"Enviando transcripción ({len(transcript)} chars) a OpenRouter para análisis")
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=data,
+            timeout=90
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"Error en API OpenRouter (video summary): Status {response.status_code}, Response: {response.text[:300]}")
+            return None
+        
+        response_data = response.json()
+        if 'choices' not in response_data or not response_data['choices']:
+            logger.error(f"Respuesta inválida de API (video summary): {response_data}")
+            return None
+        
+        content = response_data['choices'][0]['message']['content'].strip()
+        logger.info(f"Resumen de video generado: {len(content)} caracteres")
+        return content
+        
+    except requests.exceptions.Timeout:
+        logger.error("Timeout en solicitud de resumen de video (90s)")
+        return None
+    except requests.exceptions.RequestException as re:
+        logger.error(f"Error de conexión en resumen de video: {re}")
+        return None
+    except Exception as e:
+        logger.error(f"Error inesperado en process_video_summary: {e}", exc_info=True)
+        return None
