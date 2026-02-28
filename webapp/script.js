@@ -303,8 +303,31 @@ function renderNotes() {
 
         const dateStr = formatNoteDate(note.created_at);
 
+        // Construir HTML de imagen si existe
+        let imageHtml = '';
+        if (note.image_file_id) {
+            const imgSrc = `/api/telegram-image/${note.image_file_id}`;
+            imageHtml = `
+                <div class="note-image-container">
+                    <div class="note-image-placeholder">📷 Cargando imagen…</div>
+                    <img class="note-image" src="${imgSrc}" alt="Imagen de nota"
+                         onload="this.style.display='block'; this.previousElementSibling.style.display='none';"
+                         onerror="this.style.display='none'; this.previousElementSibling.textContent='⚠️ Imagen no disponible';"
+                    />
+                </div>
+            `;
+        }
+
+        // Construir HTML de contenido de texto (ocultar si es solo placeholder de imagen)
+        let contentHtml = '';
+        const trimmedContent = (note.content || '').trim();
+        if (trimmedContent && trimmedContent !== '📸 Imagen') {
+            contentHtml = `<div class="note-content">${escapeHtml(trimmedContent)}</div>`;
+        }
+
         card.innerHTML = `
-            <div class="note-content">${escapeHtml(note.content)}</div>
+            ${imageHtml}
+            ${contentHtml}
             <div class="note-meta">
                 <span class="note-date">${dateStr}</span>
                 <div class="note-actions">

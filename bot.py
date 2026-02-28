@@ -598,23 +598,67 @@ async def post_init(application):
         logging.error(f"Error configurando el botón de menú: {e}")
 
 # --- HANDLER PARA COMANDO /nota ---
+# --- HANDLER PARA /nota CON FOTO ---
+async def nota_photo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Guarda una nota con imagen cuando el usuario envía una foto con caption /nota."""
+    user_id = update.effective_user.id
+    caption = update.message.caption or ""
+
+    # Extraer texto después de /nota
+    parts = caption.split(None, 1)
+    content = parts[1].strip() if len(parts) > 1 else ""
+
+    # Obtener file_id de la imagen
+    image_file_id = None
+    if update.message.photo:
+        image_file_id = update.message.photo[-1].file_id
+    elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith('image/'):
+        image_file_id = update.message.document.file_id
+
+    if not image_file_id:
+        await update.message.reply_text("⚠️ No pude detectar la imagen. Intenta de nuevo.")
+        return
+
+    # Si no hay texto, usar placeholder
+    if not content:
+        content = "📸 Imagen"
+
+    create_note(user_id, content, image_file_id)
+    await update.message.reply_text("✅ Nota con imagen guardada correctamente.")
+    logging.info(f"Nota con imagen guardada para usuario {user_id}: {content[:50]}... (img: {image_file_id[:20]}...)")
+
+# --- HANDLER PARA COMANDO /nota ---
 async def nota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Guarda una nota persistente directamente sin pasar por brain.py."""
     user_id = update.effective_user.id
     # Extraer texto después de /nota
     text = update.message.text
     content = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
-    
-    if not content.strip():
+
+    # Verificar si hay una imagen pendiente de un mensaje anterior
+    image_file_id = context.user_data.get('pending_image_id')
+
+    if not content.strip() and not image_file_id:
         await update.message.reply_text(
             "⚠️ Por favor, escribe lo que deseas guardar después del comando.\n"
-            "Ejemplo: /nota La clave del wifi es ABC123"
+            "Ejemplo: /nota La clave del wifi es ABC123\n"
+            "También puedes enviar una foto con /nota como leyenda."
         )
         return
-    
-    create_note(user_id, content.strip())
-    await update.message.reply_text("✅ Nota guardada correctamente.")
-    logging.info(f"Nota guardada para usuario {user_id}: {content[:50]}...")
+
+    # Si no hay texto pero sí imagen pendiente, usar placeholder
+    if not content.strip():
+        content = "📸 Imagen"
+
+    create_note(user_id, content.strip(), image_file_id)
+
+    # Limpiar imagen pendiente después de guardar
+    if 'pending_image_id' in context.user_data:
+        del context.user_data['pending_image_id']
+
+    emoji = "🖼️" if image_file_id else "✅"
+    await update.message.reply_text(f"{emoji} Nota guardada correctamente.")
+    logging.info(f"Nota guardada para usuario {user_id}: {content[:50]}... (img: {bool(image_file_id)})")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 ¡Hola! Soy Clusivai. Puedo chatear contigo y gestionar tus recordatorios. ¡Pruébame!")
@@ -637,6 +681,11 @@ if __name__ == '__main__':
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("nota", nota_command))
+    # Nuevo: fotos/documentos-imagen con caption /nota
+    application.add_handler(MessageHandler(
+        (filters.PHOTO | filters.Document.IMAGE) & filters.CaptionRegex(r'^/nota'),
+        nota_photo_command
+    ))
     application.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & (~filters.COMMAND), handle_message))
     
     # Programar el revisor cada 60 segundos

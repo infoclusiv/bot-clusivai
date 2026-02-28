@@ -1,4 +1,4 @@
-from flask import Flask, send_from_directory, request, jsonify
+from flask import Flask, send_from_directory, request, jsonify, Response
 from flask_cors import CORS
 import os
 import json
@@ -103,6 +103,45 @@ def static_files(path):
     return send_from_directory(WEBAPP_DIR, path)
 
 # --- ENDPOINTS DE NOTAS ---
+@app.route('/api/telegram-image/<path:file_id>')
+def telegram_image_proxy(file_id):
+    """Proxy que descarga una imagen de Telegram por su file_id y la sirve al cliente.
+    Esto evita exponer el token del bot en el frontend."""
+    try:
+        # 1. Obtener file_path de Telegram
+        tg_response = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile",
+            params={"file_id": file_id},
+            timeout=10
+        )
+        tg_data = tg_response.json()
+
+        if not tg_data.get('ok'):
+            logging.warning(f"Telegram getFile failed for {file_id}: {tg_data}")
+            return jsonify({"error": "Image not found"}), 404
+
+        file_path = tg_data['result']['file_path']
+        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+
+        # 2. Descargar la imagen
+        img_response = requests.get(file_url, timeout=30)
+
+        if img_response.status_code != 200:
+            return jsonify({"error": "Could not download image"}), 502
+
+        content_type = img_response.headers.get('Content-Type', 'image/jpeg')
+
+        return Response(
+            img_response.content,
+            content_type=content_type,
+            headers={
+                'Cache-Control': 'public, max-age=86400'  # Cache 24 h
+            }
+        )
+    except Exception as e:
+        logging.error(f"Error proxying telegram image {file_id}: {e}")
+        return jsonify({"error": "Internal error"}), 500
+
 @app.route('/api/notes', methods=['GET'])
 def get_notes():
     user_id = request.args.get('user_id')
@@ -112,16 +151,19 @@ def get_notes():
         notes = get_notes_by_user(user_id)
         notes_list = []
         for n in notes:
+            # Orden: (id, content, created_at, updated_at, image_file_id)
             notes_list.append({
                 "id": n[0],
                 "content": n[1],
                 "created_at": n[2],
-                "updated_at": n[3]
+                "updated_at": n[3],
+                "image_file_id": n[4] if len(n) > 4 else None
             })
         return jsonify({"success": True, "notes": notes_list})
     except Exception as e:
         logging.error(f"Error in GET /api/notes: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+
 
 @app.route('/api/notes/<int:note_id>', methods=['PUT'])
 def edit_note(note_id):

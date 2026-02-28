@@ -29,6 +29,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             content TEXT NOT NULL,
+            image_file_id TEXT DEFAULT NULL,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
@@ -194,19 +195,25 @@ def get_today_reminders(user_id):
     return rows
 
 # --- FUNCIONES DE NOTAS ---
-def create_note(user_id, content):
-    """Crea una nueva nota para el usuario."""
+def create_note(user_id, content, image_file_id=None):
+    """Crea una nueva nota para el usuario, opcionalmente con imagen."""
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute('INSERT INTO notes (user_id, content) VALUES (?, ?)', (user_id, content))
+    cursor.execute(
+        'INSERT INTO notes (user_id, content, image_file_id) VALUES (?, ?, ?)',
+        (user_id, content, image_file_id)
+    )
     conn.commit()
     conn.close()
 
 def get_notes_by_user(user_id):
-    """Retorna todas las notas de un usuario, ordenadas por fecha de creación descendente."""
+    """Retorna todas las notas de un usuario, incluyendo image_file_id."""
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT id, content, created_at, updated_at FROM notes WHERE user_id = ? ORDER BY created_at DESC', (user_id,))
+    cursor.execute(
+        'SELECT id, content, created_at, updated_at, image_file_id FROM notes WHERE user_id = ? ORDER BY created_at DESC',
+        (user_id,)
+    )
     rows = cursor.fetchall()
     conn.close()
     return rows
