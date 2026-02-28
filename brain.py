@@ -142,6 +142,12 @@ def process_user_input(text, history=None, active_reminders=None):
     - Responde siempre de forma amable en español.
     - IMPORTANTE: Si en el historial existe una pregunta de confirmación o seguimiento, el siguiente mensaje del usuario es una RESPUESTA a esa pregunta, no una nueva acción.
     
+    REGLA SOBRE IMÁGENES:
+    - Si el mensaje del usuario incluye "[📸 El usuario adjuntó una imagen a este mensaje]", significa que hay una imagen adjunta que se guardará automáticamente con el recordatorio.
+    - Cuando veas este indicador y el usuario diga "recuérdame esto", "guarda esto", o similar, crea un recordatorio con action: "CREATE".
+    - En el campo "message", incluye la descripción que dio el usuario. No necesitas describir la imagen, ya se adjunta automáticamente.
+    - Si el usuario solo adjuntó la imagen sin dar instrucciones claras de fecha/hora, pregúntale cuándo quiere ser recordado.
+    
     NOTAS PERSISTENTES (son DIFERENTES de los recordatorios):
     - Las NOTAS se guardan con el comando /nota y NO tienen fecha/hora. Son datos que el usuario quiere recordar (contraseñas, datos, ideas, etc.).
     - Los RECORDATORIOS tienen fecha/hora y generan alertas.

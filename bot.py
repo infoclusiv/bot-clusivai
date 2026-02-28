@@ -35,12 +35,12 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     conn = get_connection()
     cursor = conn.cursor()
     
-    # Buscamos tareas pendientes cuya fecha ya pasó
-    cursor.execute('SELECT id, user_id, message, recurrence FROM reminders WHERE remind_at <= ? AND status = "pending"', (now_str,))
+    # Buscamos tareas pendientes cuya fecha ya pasó - INCLUIMOS image_file_id
+    cursor.execute('SELECT id, user_id, message, recurrence, image_file_id FROM reminders WHERE remind_at <= ? AND status = "pending"', (now_str,))
     due_reminders = cursor.fetchall()
     
     for rem in due_reminders:
-        rem_id, user_id, msg, recurrence = rem
+        rem_id, user_id, msg, recurrence, image_file_id = rem
         try:
             alert_text = f"⏰ ¡ALERTA (ID: {rem_id})!:\n📌 {msg}"
             
@@ -49,20 +49,28 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                 # Pasar datos iniciales por URL
                 import urllib.parse
                 encoded_msg = urllib.parse.quote(msg)
-                # remind_at no está cargado en la query original, vamos a cargarlo para pasarlo
-                # O mejor, usamos el valor que ya tenemos en la DB
-                # Por ahora pasamos el ID y el mensaje
                 webapp_url_with_params = f"{WEBAPP_URL}?user_id={user_id}&id={rem_id}&message={encoded_msg}"
                 keyboard = [[InlineKeyboardButton("⏳ Reprogramar", web_app=WebAppInfo(url=webapp_url_with_params))]]
                 reply_markup = InlineKeyboardMarkup(keyboard)
             else:
                 reply_markup = None
 
-            await context.bot.send_message(
-                chat_id=user_id, 
-                text=alert_text,
-                reply_markup=reply_markup
-            )
+            # ENVÍO DE ALERTA: Si hay imagen, enviar foto; si no, enviar mensaje
+            if image_file_id:
+                await context.bot.send_photo(
+                    chat_id=user_id,
+                    photo=image_file_id,
+                    caption=alert_text,
+                    reply_markup=reply_markup
+                )
+                logging.info(f"Alerta con foto enviada al usuario {user_id} para recordatorio {rem_id}")
+            else:
+                await context.bot.send_message(
+                    chat_id=user_id, 
+                    text=alert_text,
+                    reply_markup=reply_markup
+                )
+                logging.info(f"Alerta de texto enviada al usuario {user_id} para recordatorio {rem_id}")
             
             if recurrence:
                 # Calcular la siguiente ocurrencia
@@ -203,26 +211,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Si no hay texto ni imagen, salir
         return
     
-    if not user_text and has_image:
-        # Hay imagen pero no hay texto - guardamos la imagen para el siguiente mensaje
-        image_base64 = await download_image_to_base64(update)
-        if image_base64:
-            # Guardar la imagen en el estado del usuario para usarla con el siguiente mensaje de texto
-            context.user_data['pending_image'] = image_base64
-            await update.message.reply_text("📷 He recibido tu imagen. Ahora dime qué quieres que haga con ella. (Ej: 'Recuérdame revisar esto mañana')")
+    # 1. CAPTURA DE IMAGEN: Guardar el file_id sin enviar a IA
+    if has_image:
+        # Obtener el file_id de la foto (tomamos la de mayor resolución)
+        if update.message.photo:
+            photo_id = update.message.photo[-1].file_id
         else:
-            await update.message.reply_text("No pude procesar la imagen. ¿Puedes intentar de nuevo?")
-        return
+            photo_id = update.message.document.file_id
+        
+        context.user_data['pending_image_id'] = photo_id
+        logging.info(f"Imagen recibida para usuario {user_id}: {photo_id}")
+        
+        # Si no hay caption de texto, solicitar que escriba qué quiere hacer
+        if not user_text:
+            await update.message.reply_text("📸 Imagen recibida y guardada. Ahora escríbeme qué quieres hacer con ella.\n\nEjemplo: 'Recuérdame esto mañana a las 8am'")
+            return
     
-    # Si hay texto y el usuario había enviado una imagen previamente (sin caption)
-    # usar esa imagen junto con el texto actual
-    pending_image = context.user_data.get('pending_image')
+    # 2. RECUPERAR IMAGE_ID PENDIENTE (si existe de un mensaje anterior)
+    image_to_save = context.user_data.get('pending_image_id')
     
-    # Limpiar la imagen pendiente después de usarla
-    if pending_image:
-        del context.user_data['pending_image']
-    
-    logging.info(f"Mensaje recibido de usuario {user_id}: {user_text} (con imagen: {bool(pending_image or has_image)})")
+    logging.info(f"Mensaje recibido de usuario {user_id}: {user_text} (con imagen_id: {bool(image_to_save)})")
     
     await update.message.reply_chat_action("typing")
     
@@ -237,24 +245,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Obtener recordatorios activos para contexto
     active_reminders = get_user_reminders(user_id)
     
-    # Determinar si usamos el modelo de visión o el normal
-    if pending_image or has_image:
-        # Descargar imagen si no la tenemos pendiente
-        if not pending_image and has_image:
-            image_base64 = await download_image_to_base64(update)
-        else:
-            image_base64 = pending_image
-        
-        if image_base64:
-            logging.info(f"Usando modelo de visión para usuario {user_id}")
-            res = process_vision_input(user_text, image_base64, history=history, active_reminders=active_reminders)
-        else:
-            # Fallback al modelo normal si falla la descarga
-            logging.warning(f"Fallo al descargar imagen, usando modelo normal para usuario {user_id}")
-            res = process_user_input(user_text, history=history, active_reminders=active_reminders)
-    else:
-        # La IA analiza el texto con contexto de historial y recordatorios activos
-        res = process_user_input(user_text, history=history, active_reminders=active_reminders)
+    # 3. PROCESAR TEXTO (si hay imagen pendiente, enriquecer el texto para que la IA lo sepa)
+    text_to_process = user_text
+    if image_to_save:
+        text_to_process = f"{user_text}\n[📸 El usuario adjuntó una imagen a este mensaje]"
+    
+    res = process_user_input(text_to_process, history=history, active_reminders=active_reminders)
     
     if not res:
         logging.error(f"process_user_input retornó None para usuario {user_id}")
@@ -272,8 +268,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action == "CREATE":
             recurrence = res.get("recurrence")
             date_str = res.get("date")
-            add_reminder(user_id, res.get("message"), date_str, recurrence)
+            
+            # Recuperar imagen pendiente (si existe)
+            image_file_id = context.user_data.get('pending_image_id')
+            
+            # Guardar recordatorio con imagen
+            add_reminder(user_id, res.get("message"), date_str, recurrence, image_file_id)
+            
+            # Limpiar imagen pendiente después de guardar
+            if 'pending_image_id' in context.user_data:
+                del context.user_data['pending_image_id']
+            
             msg_recurrence = f"\n🔁 Recurrencia: {recurrence}" if recurrence else ""
+            emoji = "🖼️" if image_file_id else "✅"
             
             # Formatear la fecha para mostrar el día de la semana
             try:
@@ -285,7 +292,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 fecha_formateada = date_str
             
-            reply_message = f"✅ ¡Perfecto! He guardado tu recordatorio:\n\n📍 {res.get('message')}\n📅 {fecha_formateada}{msg_recurrence}"
+            reply_message = f"{emoji} ¡Perfecto! He guardado tu recordatorio:\n\n📍 {res.get('message')}\n📅 {fecha_formateada}{msg_recurrence}"
             
         elif action == "LIST":
             # Cambiamos para mostrar solo el botón del calendario, no la lista larga de texto

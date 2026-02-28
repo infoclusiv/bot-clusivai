@@ -83,14 +83,15 @@ def get_reminders():
     try:
         reminders = get_user_reminders(user_id)
         # Convert list of tuples to list of dicts for JSON serialization
-        # (id, message, remind_at, recurrence)
+        # (id, message, remind_at, recurrence, image_file_id)
         reminders_list = []
         for r in reminders:
             reminders_list.append({
                 "id": r[0],
                 "message": r[1],
                 "date": r[2],
-                "recurrence": r[3]
+                "recurrence": r[3],
+                "image_file_id": r[4] if len(r) > 4 else None
             })
         return jsonify({"success": True, "reminders": reminders_list})
     except Exception as e:

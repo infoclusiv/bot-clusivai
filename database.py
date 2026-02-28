@@ -13,7 +13,8 @@ def init_db():
             message TEXT NOT NULL,
             remind_at DATETIME NOT NULL,
             recurrence TEXT DEFAULT NULL,
-            status TEXT DEFAULT 'pending'
+            status TEXT DEFAULT 'pending',
+            image_file_id TEXT DEFAULT NULL
         )
     ''')
     cursor.execute('''
@@ -35,18 +36,18 @@ def init_db():
     conn.commit()
     conn.close()
 
-def add_reminder(user_id, message, remind_at, recurrence=None):
+def add_reminder(user_id, message, remind_at, recurrence=None, image_file_id=None):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute('INSERT INTO reminders (user_id, message, remind_at, recurrence) VALUES (?, ?, ?, ?)', 
-                   (user_id, message, remind_at, recurrence))
+    cursor.execute('INSERT INTO reminders (user_id, message, remind_at, recurrence, image_file_id) VALUES (?, ?, ?, ?, ?)', 
+                   (user_id, message, remind_at, recurrence, image_file_id))
     conn.commit()
     conn.close()
 
 def get_user_reminders(user_id):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT id, message, remind_at, recurrence FROM reminders WHERE user_id = ? AND status = "pending"', (user_id,))
+    cursor.execute('SELECT id, message, remind_at, recurrence, image_file_id FROM reminders WHERE user_id = ? AND status = "pending"', (user_id,))
     rows = cursor.fetchall()
     conn.close()
     return rows
