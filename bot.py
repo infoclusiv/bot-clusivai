@@ -10,7 +10,7 @@ from datetime import datetime
 from dateutil import rrule
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler, CallbackQueryHandler
 
 from brain import process_user_input, process_notes_query, process_vision_input, process_video_summary
 from database import (add_reminder, get_user_reminders, get_connection, 
@@ -222,7 +222,7 @@ async def process_x_video(update: Update, context: ContextTypes.DEFAULT_TYPE, ur
     
     try:
         # ── PASO 1: Descargar audio ──
-        status_msg = await update.message.reply_text("⏳ Descargando audio del video de X...")
+        status_msg = await update.effective_message.reply_text("⏳ Descargando audio del video de X...")
         
         audio_result, info_or_error = download_audio(url)
         
@@ -290,13 +290,13 @@ async def process_x_video(update: Update, context: ContextTypes.DEFAULT_TYPE, ur
             # Dividir en chunks respetando el límite de Telegram
             chunks = split_message(response_text, 4096)
             for chunk in chunks:
-                await update.message.reply_text(chunk, parse_mode="Markdown")
+                await update.effective_message.reply_text(chunk, parse_mode="Markdown")
         else:
             try:
-                await update.message.reply_text(response_text, parse_mode="Markdown")
+                await update.effective_message.reply_text(response_text, parse_mode="Markdown")
             except Exception:
                 # Si falla el Markdown, enviar sin formato
-                await update.message.reply_text(response_text.replace('*', '').replace('_', ''))
+                await update.effective_message.reply_text(response_text.replace('*', '').replace('_', ''))
         
         # ── Actualizar historial de conversación ──
         # Guardar contexto del video para que el usuario pueda hacer preguntas de seguimiento
@@ -327,12 +327,13 @@ async def process_x_video(update: Update, context: ContextTypes.DEFAULT_TYPE, ur
         
     except Exception as e:
         logging.error(f"Error procesando video de X.com para usuario {user_id}: {e}", exc_info=True)
-        try:
-            await update.message.reply_text(
-                "❌ Hubo un error inesperado procesando el video. Intenta de nuevo."
-            )
-        except Exception:
-            pass
+        if update.effective_message:
+            try:
+                await update.effective_message.reply_text(
+                    "❌ Hubo un error inesperado procesando el video. Intenta de nuevo."
+                )
+            except Exception:
+                pass
     
     finally:
         # Siempre limpiar archivos temporales
@@ -373,16 +374,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text or update.message.caption
     user_id = update.effective_user.id
     
-    # ── DETECCIÓN DE VIDEO DE X.COM ──
-    # Verificar si el mensaje contiene una URL de X.com/Twitter ANTES de cualquier otro procesamiento
+    # ── DETECCIÓN DE ENLACE DE TWITTER / X.COM ──
+    # Si el mensaje contiene una URL de X.com/Twitter, mostramos opciones
     if user_text:
         x_url = extract_x_url(user_text)
         if x_url:
-            await process_x_video(update, context, x_url, user_text)
+            logging.info(f"Enlace de Twitter/X detectado para usuario {user_id}: {x_url}")
+            
+            # Guardar la URL para usarla en el callback (callback_data tiene límite de 64 bytes)
+            # Usamos un ID de mensaje o timestamp para evitar colisiones
+            msg_id = update.message.message_id
+            if 'x_urls' not in context.user_data:
+                context.user_data['x_urls'] = {}
+            context.user_data['x_urls'][str(msg_id)] = {
+                'url': x_url,
+                'text': user_text
+            }
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("🎬 Analizar Video", callback_data=f"x_video:{msg_id}"),
+                    InlineKeyboardButton("⏰ Recordatorio", callback_data=f"x_reminder:{msg_id}")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                "🐦 He detectado un enlace de Twitter/X. ¿Qué te gustaría hacer?",
+                reply_markup=reply_markup
+            )
             return
+
+    await process_normal_message(update, context, user_text, user_id)
+
+async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str, user_id: int):
+    """Procesamiento normal de mensajes (IA, recordatorios, notas, etc.)"""
     
     # Verificar si hay una imagen adjunta
-    has_image = update.message.photo or (update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith('image/'))
+    msg = update.effective_message
+    has_image = msg and (msg.photo or (msg.document and msg.document.mime_type and msg.document.mime_type.startswith('image/')))
     
     if not user_text and not has_image:
         # Si no hay texto ni imagen, salir
@@ -391,17 +421,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1. CAPTURA DE IMAGEN: Guardar el file_id sin enviar a IA
     if has_image:
         # Obtener el file_id de la foto (tomamos la de mayor resolución)
-        if update.message.photo:
-            photo_id = update.message.photo[-1].file_id
+        if msg.photo:
+            photo_id = msg.photo[-1].file_id
         else:
-            photo_id = update.message.document.file_id
+            photo_id = msg.document.file_id
         
         context.user_data['pending_image_id'] = photo_id
         logging.info(f"Imagen recibida para usuario {user_id}: {photo_id}")
         
         # Si no hay caption de texto, solicitar que escriba qué quiere hacer
         if not user_text:
-            await update.message.reply_text("📸 Imagen recibida y guardada. Ahora escríbeme qué quieres hacer con ella.\n\nEjemplo: 'Recuérdame esto mañana a las 8am'")
+            await msg.reply_text("📸 Imagen recibida y guardada. Ahora escríbeme qué quieres hacer con ella.\n\nEjemplo: 'Recuérdame esto mañana a las 8am'")
             return
     
     # 2. RECUPERAR IMAGE_ID PENDIENTE (si existe de un mensaje anterior)
@@ -409,7 +439,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logging.info(f"Mensaje recibido de usuario {user_id}: {user_text} (con imagen_id: {bool(image_to_save)})")
     
-    await update.message.reply_chat_action("typing")
+    # Usar el chat efectivo para acciones que no dependen de un mensaje específico
+    chat = update.effective_chat
+    await chat.send_action("typing")
     
     # Inicializar historial si no existe
     if 'history' not in context.user_data:
@@ -427,30 +459,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if image_to_save:
         text_to_process = f"{user_text}\n[📸 El usuario adjuntó una imagen a este mensaje]"
     
-    res = process_user_input(text_to_process, history=history, active_reminders=active_reminders)
-    
-    if not res:
-        logging.error(f"process_user_input retornó None para usuario {user_id}")
-        await update.message.reply_text("Lo siento, tuve un problema con mi conexión cerebral.")
-        # Limpiar historial ante error para evitar estados corruptos
-        context.user_data['history'] = []
-        return
-    
-    logging.info(f"Respuesta de IA para usuario {user_id}: {res}")
-
-    action = res.get("action")
-    reply_message = None
-    
     try:
+        res = process_user_input(text_to_process, history=history, active_reminders=active_reminders)
+        
+        if not res:
+            logging.error(f"process_user_input retornó None para usuario {user_id}")
+            await update.effective_message.reply_text("Lo siento, tuve un problema con mi conexión cerebral.")
+            # Limpiar historial ante error para evitar estados corruptos
+            context.user_data['history'] = []
+            return
+        
+        logging.info(f"Respuesta de IA para usuario {user_id}: {res}")
+
+        action = res.get("action")
+        reply_message = None
+        
         if action == "CREATE":
             recurrence = res.get("recurrence")
             date_str = res.get("date")
+            message = res.get("message")
+
+            # Validar que tengamos una fecha para el recordatorio
+            if not date_str:
+                # No intentamos guardar en base de datos para evitar errores de integridad
+                await update.effective_message.reply_text(
+                    "Necesito saber cuándo quieres que te recuerde esto. "
+                    "Por ejemplo: \"mañana a las 9am\" o \"el viernes a las 18:00\"."
+                )
+                return
+
+            # Asegurar que el mensaje no esté vacío
+            if not message or not str(message).strip():
+                message = "Revisar enlace compartido"
             
             # Recuperar imagen pendiente (si existe)
             image_file_id = context.user_data.get('pending_image_id')
             
             # Guardar recordatorio con imagen
-            add_reminder(user_id, res.get("message"), date_str, recurrence, image_file_id)
+            add_reminder(user_id, message, date_str, recurrence, image_file_id)
             
             # Limpiar imagen pendiente después de guardar
             if 'pending_image_id' in context.user_data:
@@ -469,7 +515,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 fecha_formateada = date_str
             
-            reply_message = f"{emoji} ¡Perfecto! He guardado tu recordatorio:\n\n📍 {res.get('message')}\n📅 {fecha_formateada}{msg_recurrence}"
+            reply_message = f"{emoji} ¡Perfecto! He guardado tu recordatorio:\n\n📍 {message}\n📅 {fecha_formateada}{msg_recurrence}"
             
         elif action == "LIST":
             # Cambiamos para mostrar solo el botón del calendario, no la lista larga de texto
@@ -563,9 +609,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Enviar respuesta
         if reply_message:
             if action == "LIST":
-                await update.message.reply_text(reply_message, parse_mode="Markdown", reply_markup=reply_markup)
+                await update.effective_message.reply_text(reply_message, parse_mode="Markdown", reply_markup=reply_markup)
             else:
-                await update.message.reply_text(reply_message)
+                await update.effective_message.reply_text(reply_message)
         
         # Actualizar historial con el nuevo mensaje y respuesta
         context.user_data['history'].append({"role": "user", "content": user_text})
@@ -578,10 +624,85 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.info(f"Historial podado para usuario {user_id}, nuevo tamaño: {len(context.user_data['history'])}")
     
     except Exception as e:
-        logging.error(f"Error en handle_message para usuario {user_id}: {e}", exc_info=True)
-        await update.message.reply_text("Hubo un error procesando tu solicitud.")
+        logging.error(f"Error en process_normal_message para usuario {user_id}: {e}", exc_info=True)
+        try:
+            if update.effective_message:
+                await update.effective_message.reply_text("Hubo un error procesando tu solicitud.")
+            else:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="Hubo un error procesando tu solicitud."
+                )
+        except Exception:
+            # Fallback si incluso el envío del mensaje de error falla
+            try:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="Hubo un error procesando tu solicitud."
+                )
+            except Exception:
+                pass
         # Limpiar historial ante error
         context.user_data['history'] = []
+
+async def x_link_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja las opciones elegidas para enlaces de Twitter/X."""
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        data = query.data
+        user_id = update.effective_user.id
+        
+        if ":" not in data:
+            return
+            
+        action, msg_id = data.split(":", 1)
+        
+        x_data = context.user_data.get('x_urls', {}).get(msg_id)
+        if not x_data:
+            await query.edit_message_text("❌ Lo siento, la información de este enlace ya no está disponible.")
+            return
+            
+        url = x_data['url']
+        user_text = x_data['text']
+        
+        logging.info(f"Callback detectado: {action} para el mensaje {msg_id}")
+        
+        if action == "x_video":
+            # Editar el mensaje para indicar que se está procesando
+            await query.edit_message_text("⏳ Iniciando análisis del video...")
+            await process_x_video(update, context, url, user_text)
+        elif action == "x_reminder":
+            # Editar el mensaje para indicar que se está procesando el recordatorio
+            await query.edit_message_text("⏳ Preparando tu recordatorio...")
+            
+            # Enriquecer el texto para que la IA sepa que la intención es un recordatorio.
+            # Incluimos una instrucción más clara con contexto de fecha.
+            instruction = (
+                f"Quiero agendar un recordatorio para revisar este enlace: {url}. "
+                "Si no indico claramente cuándo, pregúntame para cuándo quiero el recordatorio."
+            )
+            
+            # Extraer texto adicional del usuario (sin la URL) para dar más contexto
+            extra_text = user_text.replace(url, '').strip()
+            if extra_text and len(extra_text) > 2:
+                instruction = f"Quiero agendar un recordatorio: {extra_text}. Enlace: {url}"
+            
+            await process_normal_message(update, context, instruction, user_id)
+    except Exception as e:
+        logging.error(f"Error en x_link_callback_handler: {e}", exc_info=True)
+        try:
+            await query.edit_message_text("❌ Ocurrió un error al procesar tu solicitud.")
+        except Exception:
+            # Si el mensaje ya fue editado o eliminado, intentar enviar uno nuevo
+            try:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="❌ Ocurrió un error al procesar tu solicitud."
+                )
+            except Exception:
+                pass
 
 
 async def post_init(application):
@@ -686,6 +807,7 @@ if __name__ == '__main__':
         (filters.PHOTO | filters.Document.IMAGE) & filters.CaptionRegex(r'^/nota'),
         nota_photo_command
     ))
+    application.add_handler(CallbackQueryHandler(x_link_callback_handler, pattern=r"^x_"))
     application.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & (~filters.COMMAND), handle_message))
     
     # Programar el revisor cada 60 segundos
