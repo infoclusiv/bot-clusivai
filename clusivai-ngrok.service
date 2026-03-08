@@ -1,0 +1,16 @@
+[Unit]
+Description=Clusivai ngrok Tunnel
+After=network.target clusivai-webapp.service
+Requires=clusivai-webapp.service
+
+[Service]
+Type=simple
+User=clusiv
+WorkingDirectory=/home/clusiv/bot-recordatorios/bot-clusivai
+ExecStart=/usr/bin/env bash /home/clusiv/bot-recordatorios/bot-clusivai/start-ngrok.sh
+Restart=always
+RestartSec=5
+EnvironmentFile=/home/clusiv/bot-recordatorios/bot-clusivai/.env
+
+[Install]
+WantedBy=multi-user.target

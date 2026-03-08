@@ -1,6 +1,7 @@
 import os
 import logging
 import json
+import urllib.parse
 import pytz
 import logging
 import json
@@ -21,11 +22,35 @@ from video_handler import extract_x_url, download_audio, transcribe_audio, clean
 
 load_dotenv()
 
-WEBAPP_URL = os.getenv("WEBAPP_URL")
+WEBAPP_URL = os.getenv("PUBLIC_WEBAPP_URL") or os.getenv("WEBAPP_URL")
 VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"
 DEFAULT_MODEL = os.getenv("MODEL_NAME")
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+
+def build_webapp_url(**params):
+    if not WEBAPP_URL:
+        return None
+
+    parsed_url = urllib.parse.urlsplit(WEBAPP_URL)
+    merged_params = dict(urllib.parse.parse_qsl(parsed_url.query, keep_blank_values=True))
+
+    for key, value in params.items():
+        if value is not None:
+            merged_params[key] = str(value)
+
+    return urllib.parse.urlunsplit((
+        parsed_url.scheme,
+        parsed_url.netloc,
+        parsed_url.path,
+        urllib.parse.urlencode(merged_params),
+        parsed_url.fragment,
+    ))
+
+
+if not WEBAPP_URL:
+    logging.warning("No PUBLIC_WEBAPP_URL/WEBAPP_URL configured; Telegram WebApp buttons will be disabled")
 
 # --- REVISOR DE RECORDATORIOS (Bogotá Time) ---
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
@@ -46,11 +71,8 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             alert_text = f"⏰ ¡ALERTA (ID: {rem_id})!:\n📌 {msg}"
             
             # Botón para abrir la Web App de reprogramación
-            if WEBAPP_URL:
-                # Pasar datos iniciales por URL
-                import urllib.parse
-                encoded_msg = urllib.parse.quote(msg)
-                webapp_url_with_params = f"{WEBAPP_URL}?user_id={user_id}&id={rem_id}&message={encoded_msg}"
+            webapp_url_with_params = build_webapp_url(user_id=user_id, id=rem_id, message=msg)
+            if webapp_url_with_params:
                 keyboard = [[InlineKeyboardButton("⏳ Reprogramar", web_app=WebAppInfo(url=webapp_url_with_params))]]
                 reply_markup = InlineKeyboardMarkup(keyboard)
             else:
@@ -522,8 +544,8 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
             reply_message = "📅 *Tus recordatorios:*\n\nHaz clic abajo para verlos en el calendario interactivo."
             
             # Botón para abrir la Web App en modo calendario
-            if WEBAPP_URL:
-                webapp_calendar_url = f"{WEBAPP_URL}?user_id={user_id}&mode=calendar"
+            webapp_calendar_url = build_webapp_url(user_id=user_id, mode="calendar")
+            if webapp_calendar_url:
                 keyboard = [[InlineKeyboardButton("📅 Ver en Calendario", web_app=WebAppInfo(url=webapp_calendar_url))]]
                 reply_markup = InlineKeyboardMarkup(keyboard)
             else:
@@ -710,7 +732,11 @@ async def post_init(application):
     from telegram import MenuButtonWebApp
     try:
         # Configurar el botón de menú para abrir la Web App en modo calendario
-        url = f"{WEBAPP_URL}?mode=calendar"
+        url = build_webapp_url(mode="calendar")
+        if not url:
+            logging.warning("No webapp URL configured; skipping Telegram menu button setup")
+            return
+
         await application.bot.set_chat_menu_button(
             menu_button=MenuButtonWebApp(text="Calendar", web_app=WebAppInfo(url=url))
         )
