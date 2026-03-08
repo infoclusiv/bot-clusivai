@@ -49,15 +49,31 @@
 
         <!-- Vista de Notas -->
         <div id="notes-view" style="display: none;">
-            <header>
+            <header id="notes-categories-header">
                 <h1>📝 Mis Notas</h1>
-                <p>Tus notas guardadas con /nota</p>
+                <p>Explora primero tus categorías y luego entra a sus notas</p>
             </header>
-            <div id="notes-list" class="notes-list"></div>
-            <div id="notes-empty" class="empty-state" style="display: none;">
+            <div id="categories-list" class="categories-list"></div>
+            <div id="categories-empty" class="empty-state" style="display: none;">
                 <div class="empty-icon">📋</div>
                 <p>No tienes notas guardadas</p>
                 <span>Usa <strong>/nota</strong> en el chat para guardar información</span>
+            </div>
+
+            <div id="category-notes-view" style="display: none;">
+                <div class="category-notes-header">
+                    <button id="back-to-categories" class="secondary back-button">← Categorías</button>
+                    <div>
+                        <h2 id="current-category-title">Categoría</h2>
+                        <p id="current-category-subtitle">Tus notas guardadas</p>
+                    </div>
+                </div>
+                <div id="notes-list" class="notes-list"></div>
+                <div id="notes-empty" class="empty-state" style="display: none;">
+                    <div class="empty-icon">🗂️</div>
+                    <p>Esta categoría no tiene notas</p>
+                    <span>Guarda una nueva nota con <strong>/nota Categoría | contenido</strong></span>
+                </div>
             </div>
         </div>
 

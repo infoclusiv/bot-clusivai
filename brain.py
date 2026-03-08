@@ -427,7 +427,7 @@ def process_notes_query(user_query, notes_data, history=None):
     
     Args:
         user_query: La pregunta original del usuario
-        notes_data: Lista de tuplas (id, content, created_at, updated_at)
+        notes_data: Lista de tuplas con la forma actual de notas en la base de datos
         history: Historial de conversación
     
     Returns:
@@ -441,8 +441,17 @@ def process_notes_query(user_query, notes_data, history=None):
     if notes_data:
         notes_context = "NOTAS GUARDADAS POR EL USUARIO:\n"
         for note in notes_data:
-            note_id, content, created_at, updated_at = note
-            notes_context += f"- [Nota #{note_id}] {content} (guardada: {created_at})\n"
+            note_id = note[0]
+            content = note[1]
+
+            if len(note) >= 6:
+                category = note[2] or 'Sin categoría'
+                created_at = note[3]
+            else:
+                category = 'Sin categoría'
+                created_at = note[2]
+
+            notes_context += f"- [Nota #{note_id} | Categoría: {category}] {content} (guardada: {created_at})\n"
     else:
         notes_context = "El usuario NO tiene notas guardadas actualmente."
     

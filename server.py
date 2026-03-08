@@ -4,7 +4,7 @@ import os
 import json
 import requests
 import logging
-from database import get_connection, update_reminder_by_id, get_user_reminders, delete_reminder_by_id, get_notes_by_user, update_note, delete_note
+from database import get_connection, update_reminder_by_id, get_user_reminders, delete_reminder_by_id, get_notes_by_user, get_note_categories_by_user, update_note, delete_note, normalize_note_category, UNCATEGORIZED_LABEL
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -159,23 +159,50 @@ def telegram_image_proxy(file_id):
 @app.route('/api/notes', methods=['GET'])
 def get_notes():
     user_id = request.args.get('user_id')
+    category = request.args.get('category')
     if not user_id:
         return jsonify({"success": False, "error": "Missing user_id"}), 400
     try:
-        notes = get_notes_by_user(user_id)
+        notes = get_notes_by_user(user_id, category=category)
         notes_list = []
         for n in notes:
-            # Orden: (id, content, created_at, updated_at, image_file_id)
+            normalized_category = normalize_note_category(n[2]) or UNCATEGORIZED_LABEL
             notes_list.append({
                 "id": n[0],
                 "content": n[1],
-                "created_at": n[2],
-                "updated_at": n[3],
-                "image_file_id": n[4] if len(n) > 4 else None
+                "category": normalized_category,
+                "created_at": n[3],
+                "updated_at": n[4],
+                "image_file_id": n[5] if len(n) > 5 else None
             })
-        return jsonify({"success": True, "notes": notes_list})
+        return jsonify({
+            "success": True,
+            "category": normalize_note_category(category) or (UNCATEGORIZED_LABEL if category is not None else None),
+            "notes": notes_list
+        })
     except Exception as e:
         logging.error(f"Error in GET /api/notes: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/notes/categories', methods=['GET'])
+def get_note_categories():
+    user_id = request.args.get('user_id')
+    if not user_id:
+        return jsonify({"success": False, "error": "Missing user_id"}), 400
+
+    try:
+        categories = get_note_categories_by_user(user_id)
+        category_list = []
+        for category_name, note_count, last_updated_at in categories:
+            category_list.append({
+                "name": category_name,
+                "note_count": note_count,
+                "last_updated_at": last_updated_at
+            })
+        return jsonify({"success": True, "categories": category_list})
+    except Exception as e:
+        logging.error(f"Error in GET /api/notes/categories: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -183,12 +210,16 @@ def get_notes():
 def edit_note(note_id):
     data = request.json
     new_content = data.get('content')
+    category = data.get('category')
     if not new_content:
         return jsonify({"success": False, "error": "Missing content"}), 400
     try:
-        success = update_note(note_id, new_content)
+        success = update_note(note_id, new_content, category)
         if success:
-            return jsonify({"success": True})
+            return jsonify({
+                "success": True,
+                "category": normalize_note_category(category) or UNCATEGORIZED_LABEL
+            })
         else:
             return jsonify({"success": False, "error": "Nota no encontrada"}), 404
     except Exception as e:

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Script de migración para agregar la columna image_file_id a la tabla reminders.
-Ejecutar este script si la base de datos reminders.db ya existe.
+Script de migración para agregar columnas faltantes en la base de datos existente.
+Actualmente asegura:
+- reminders.image_file_id
+- notes.category
 """
 
 import sqlite3
@@ -12,7 +14,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, 'reminders.db')
 
 def migrate_db():
-    """Agrega la columna image_file_id a la tabla reminders si no existe."""
+    """Agrega columnas faltantes a tablas existentes si aún no existen."""
     
     if not os.path.exists(DB_PATH):
         print("✓ Base de datos no existe. Se creará una nueva con init_db().")
@@ -22,25 +24,46 @@ def migrate_db():
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
-        # Verificar si la columna ya existe
+        # Verificar si la columna image_file_id ya existe en reminders
         cursor.execute("PRAGMA table_info(reminders)")
-        columns = [col[1] for col in cursor.fetchall()]
+        reminder_columns = [col[1] for col in cursor.fetchall()]
+        migrated_any = False
         
-        if 'image_file_id' in columns:
+        if 'image_file_id' not in reminder_columns:
+            print("Agregando columna image_file_id a la tabla reminders...")
+            cursor.execute('''
+                ALTER TABLE reminders 
+                ADD COLUMN image_file_id TEXT DEFAULT NULL
+            ''')
+            migrated_any = True
+        else:
             print("✓ La columna image_file_id ya existe en la tabla reminders.")
-            conn.close()
-            return
         
-        # Agregar la columna si no existe
-        print("Agregando columna image_file_id a la tabla reminders...")
-        cursor.execute('''
-            ALTER TABLE reminders 
-            ADD COLUMN image_file_id TEXT DEFAULT NULL
-        ''')
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='notes'")
+        notes_table_exists = cursor.fetchone() is not None
+
+        if notes_table_exists:
+            cursor.execute("PRAGMA table_info(notes)")
+            note_columns = [col[1] for col in cursor.fetchall()]
+
+            if 'category' not in note_columns:
+                print("Agregando columna category a la tabla notes...")
+                cursor.execute('''
+                    ALTER TABLE notes
+                    ADD COLUMN category TEXT DEFAULT NULL
+                ''')
+                migrated_any = True
+            else:
+                print("✓ La columna category ya existe en la tabla notes.")
+        else:
+            print("✓ La tabla notes no existe todavía. Se creará con init_db().")
         
         conn.commit()
         conn.close()
-        print("✓ Migración completada exitosamente. La columna image_file_id fue agregada.")
+        if migrated_any:
+            print("✓ Migración completada exitosamente.")
+        else:
+            print("✓ No había cambios pendientes en la base de datos.")
         
     except sqlite3.OperationalError as e:
         print(f"✗ Error durante la migración: {e}")

@@ -17,7 +17,7 @@ from brain import process_user_input, process_notes_query, process_vision_input,
 from database import (add_reminder, get_user_reminders, get_connection, 
                       delete_reminder_by_text, update_reminder_by_id, 
                       set_daily_summary, get_users_with_daily_summary, get_today_reminders,
-                      create_note, get_notes_by_user)
+                      create_note, get_notes_by_user, normalize_note_category, UNCATEGORIZED_LABEL)
 from video_handler import extract_x_url, download_audio, transcribe_audio, cleanup_audio
 
 load_dotenv()
@@ -51,6 +51,25 @@ def build_webapp_url(**params):
 
 if not WEBAPP_URL:
     logging.warning("No PUBLIC_WEBAPP_URL/WEBAPP_URL configured; Telegram WebApp buttons will be disabled")
+
+
+def parse_note_category_and_content(raw_text):
+    """Parsea el formato `/nota categoria | contenido` de forma retrocompatible."""
+    content = (raw_text or '').strip()
+    if not content:
+        return None, ''
+
+    if '|' not in content:
+        return None, content
+
+    raw_category, raw_content = content.split('|', 1)
+    category = normalize_note_category(raw_category)
+    parsed_content = raw_content.strip()
+
+    if category and parsed_content:
+        return category, parsed_content
+
+    return None, content
 
 # --- REVISOR DE RECORDATORIOS (Bogotá Time) ---
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
@@ -753,7 +772,8 @@ async def nota_photo_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # Extraer texto después de /nota
     parts = caption.split(None, 1)
-    content = parts[1].strip() if len(parts) > 1 else ""
+    raw_note_text = parts[1].strip() if len(parts) > 1 else ""
+    category, content = parse_note_category_and_content(raw_note_text)
 
     # Obtener file_id de la imagen
     image_file_id = None
@@ -770,9 +790,10 @@ async def nota_photo_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not content:
         content = "📸 Imagen"
 
-    create_note(user_id, content, image_file_id)
-    await update.message.reply_text("✅ Nota con imagen guardada correctamente.")
-    logging.info(f"Nota con imagen guardada para usuario {user_id}: {content[:50]}... (img: {image_file_id[:20]}...)")
+    create_note(user_id, content, image_file_id, category)
+    saved_category = category or UNCATEGORIZED_LABEL
+    await update.message.reply_text(f"✅ Nota con imagen guardada en la categoría: {saved_category}.")
+    logging.info(f"Nota con imagen guardada para usuario {user_id}: {content[:50]}... cat={saved_category} (img: {image_file_id[:20]}...)")
 
 # --- HANDLER PARA COMANDO /nota ---
 async def nota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -780,7 +801,8 @@ async def nota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     # Extraer texto después de /nota
     text = update.message.text
-    content = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
+    raw_note_text = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
+    category, content = parse_note_category_and_content(raw_note_text)
 
     # Verificar si hay una imagen pendiente de un mensaje anterior
     image_file_id = context.user_data.get('pending_image_id')
@@ -789,6 +811,7 @@ async def nota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⚠️ Por favor, escribe lo que deseas guardar después del comando.\n"
             "Ejemplo: /nota La clave del wifi es ABC123\n"
+            "Con categoría: /nota Trabajo | Preparar informe\n"
             "También puedes enviar una foto con /nota como leyenda."
         )
         return
@@ -797,15 +820,16 @@ async def nota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not content.strip():
         content = "📸 Imagen"
 
-    create_note(user_id, content.strip(), image_file_id)
+    create_note(user_id, content.strip(), image_file_id, category)
 
     # Limpiar imagen pendiente después de guardar
     if 'pending_image_id' in context.user_data:
         del context.user_data['pending_image_id']
 
     emoji = "🖼️" if image_file_id else "✅"
-    await update.message.reply_text(f"{emoji} Nota guardada correctamente.")
-    logging.info(f"Nota guardada para usuario {user_id}: {content[:50]}... (img: {bool(image_file_id)})")
+    saved_category = category or UNCATEGORIZED_LABEL
+    await update.message.reply_text(f"{emoji} Nota guardada correctamente en la categoría: {saved_category}.")
+    logging.info(f"Nota guardada para usuario {user_id}: {content[:50]}... cat={saved_category} (img: {bool(image_file_id)})")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 ¡Hola! Soy Clusivai. Puedo chatear contigo y gestionar tus recordatorios. ¡Pruébame!")

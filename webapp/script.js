@@ -29,6 +29,13 @@ const selectedDayLabel = document.getElementById('selected-day-label');
 const remindersList = document.getElementById('reminders-list');
 
 // DOM Elements - Notes
+const notesCategoriesHeader = document.getElementById('notes-categories-header');
+const categoriesList = document.getElementById('categories-list');
+const categoriesEmpty = document.getElementById('categories-empty');
+const categoryNotesView = document.getElementById('category-notes-view');
+const currentCategoryTitle = document.getElementById('current-category-title');
+const currentCategorySubtitle = document.getElementById('current-category-subtitle');
+const backToCategoriesButton = document.getElementById('back-to-categories');
 const notesList = document.getElementById('notes-list');
 const notesEmpty = document.getElementById('notes-empty');
 
@@ -49,10 +56,13 @@ const errorMessage = document.getElementById('error-message');
 // State
 let currentDate = new Date();
 let reminders = [];
+let categories = [];
 let notes = [];
+let currentCategory = null;
 let currentReminderId = reminderId;
 let currentRecurrence = initialRecurrence;
 let activeTab = 'calendar';
+const uncategorizedLabel = 'Sin categoría';
 
 // ==================== INITIALIZATION ====================
 function init() {
@@ -267,24 +277,88 @@ async function showNotes() {
     editView.style.display = 'none';
     tg.MainButton.hide();
 
-    await fetchNotes();
-    renderNotes();
+    currentCategory = null;
+    await fetchCategories();
+    renderCategories();
 }
 
-async function fetchNotes() {
+async function fetchCategories() {
     if (!userId) return;
     try {
-        const response = await fetch(`/api/notes?user_id=${userId}`);
+        const response = await fetch(`/api/notes/categories?user_id=${userId}`);
         const data = await response.json();
         if (data.success) {
-            notes = data.notes;
+            categories = data.categories || [];
         }
     } catch (err) {
-        console.error('Error fetching notes:', err);
+        console.error('Error fetching note categories:', err);
+        categories = [];
     }
 }
 
+async function fetchNotes(categoryName) {
+    if (!userId) return;
+
+    const params = new URLSearchParams({ user_id: userId });
+    if (categoryName !== null && categoryName !== undefined) {
+        params.set('category', categoryName);
+    }
+
+    try {
+        const response = await fetch(`/api/notes?${params.toString()}`);
+        const data = await response.json();
+        if (data.success) {
+            notes = data.notes || [];
+        }
+    } catch (err) {
+        console.error('Error fetching notes:', err);
+        notes = [];
+    }
+}
+
+function renderCategories() {
+    notesCategoriesHeader.style.display = 'block';
+    categoriesList.innerHTML = '';
+    categoriesList.style.display = 'flex';
+    categoryNotesView.style.display = 'none';
+
+    if (categories.length === 0) {
+        categoriesEmpty.style.display = 'block';
+        categoriesList.style.display = 'none';
+        return;
+    }
+
+    categoriesEmpty.style.display = 'none';
+
+    categories.forEach(category => {
+        const card = document.createElement('button');
+        card.classList.add('category-card');
+        card.type = 'button';
+        card.innerHTML = `
+            <div class="category-card-main">
+                <span class="category-name">${escapeHtml(category.name)}</span>
+                <span class="category-count">${category.note_count} nota${category.note_count === 1 ? '' : 's'}</span>
+            </div>
+            <div class="category-card-meta">${formatCategoryMeta(category.last_updated_at)}</div>
+        `;
+        card.addEventListener('click', () => {
+            openCategory(category.name);
+        });
+        categoriesList.appendChild(card);
+    });
+}
+
+async function openCategory(categoryName) {
+    currentCategory = categoryName || uncategorizedLabel;
+    await fetchNotes(currentCategory);
+    renderNotes();
+}
+
 function renderNotes() {
+    notesCategoriesHeader.style.display = 'none';
+    categoryNotesView.style.display = 'block';
+    currentCategoryTitle.textContent = currentCategory || uncategorizedLabel;
+    currentCategorySubtitle.textContent = `${notes.length} nota${notes.length === 1 ? '' : 's'} guardada${notes.length === 1 ? '' : 's'}`;
     notesList.innerHTML = '';
 
     if (notes.length === 0) {
@@ -327,6 +401,7 @@ function renderNotes() {
 
         card.innerHTML = `
             ${imageHtml}
+            <div class="note-category-badge">${escapeHtml(note.category || uncategorizedLabel)}</div>
             ${contentHtml}
             <div class="note-meta">
                 <span class="note-date">${dateStr}</span>
@@ -339,6 +414,15 @@ function renderNotes() {
 
         notesList.appendChild(card);
     });
+}
+
+function formatCategoryMeta(dateStr) {
+    if (!dateStr) return 'Sin actividad reciente';
+    return `Actualizada ${formatNoteDate(dateStr)}`;
+}
+
+function categoryInputValue(category) {
+    return category === uncategorizedLabel ? '' : (category || '');
 }
 
 function formatNoteDate(dateStr) {
@@ -359,8 +443,11 @@ function escapeHtml(text) {
 }
 
 async function editNote(noteId, btnElement) {
-    const card = btnElement.closest('.note-card');
-    const currentContent = card.querySelector('.note-content').textContent;
+    const note = notes.find(currentNote => currentNote.id === noteId);
+    if (!note) return;
+
+    const currentContent = (note.content || '').trim() === '📸 Imagen' ? '' : (note.content || '');
+    const currentCategoryValue = categoryInputValue(note.category);
 
     // Create modal overlay
     const overlay = document.createElement('div');
@@ -368,6 +455,9 @@ async function editNote(noteId, btnElement) {
     overlay.innerHTML = `
         <div class="note-edit-modal">
             <h3>✏️ Editar Nota</h3>
+            <label for="edit-note-category">Categoría</label>
+            <input id="edit-note-category" type="text" maxlength="80" placeholder="Sin categoría" value="${escapeHtml(currentCategoryValue)}" />
+            <label for="edit-note-content">Contenido</label>
             <textarea id="edit-note-content">${escapeHtml(currentContent)}</textarea>
             <div class="modal-buttons">
                 <button class="secondary" id="modal-cancel">Cancelar</button>
@@ -379,6 +469,7 @@ async function editNote(noteId, btnElement) {
     document.body.appendChild(overlay);
 
     const textarea = overlay.querySelector('#edit-note-content');
+    const categoryInput = overlay.querySelector('#edit-note-category');
     textarea.focus();
     textarea.setSelectionRange(textarea.value.length, textarea.value.length);
 
@@ -395,6 +486,7 @@ async function editNote(noteId, btnElement) {
     // Save
     overlay.querySelector('#modal-save').addEventListener('click', async () => {
         const newContent = textarea.value.trim();
+        const newCategory = categoryInput.value.trim();
         if (!newContent) return;
 
         const saveBtn = overlay.querySelector('#modal-save');
@@ -405,13 +497,20 @@ async function editNote(noteId, btnElement) {
             const response = await fetch(`/api/notes/${noteId}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ content: newContent })
+                body: JSON.stringify({ content: newContent, category: newCategory })
             });
 
             const result = await response.json();
             if (result.success) {
+                const updatedCategory = result.category || uncategorizedLabel;
                 overlay.remove();
-                await fetchNotes();
+                await fetchCategories();
+
+                if (updatedCategory !== (currentCategory || uncategorizedLabel)) {
+                    currentCategory = updatedCategory;
+                }
+
+                await fetchNotes(currentCategory);
                 renderNotes();
             } else {
                 alert('Error al guardar: ' + (result.error || 'Desconocido'));
@@ -445,7 +544,8 @@ async function deleteNote(noteId, btnElement) {
                     card.style.opacity = '0';
                     card.style.transform = 'translateX(50px)';
                     setTimeout(async () => {
-                        await fetchNotes();
+                        await fetchCategories();
+                        await fetchNotes(currentCategory);
                         renderNotes();
                     }, 300);
                 } else {
@@ -461,6 +561,11 @@ async function deleteNote(noteId, btnElement) {
         }
     });
 }
+
+backToCategoriesButton.addEventListener('click', () => {
+    currentCategory = null;
+    renderCategories();
+});
 
 // ==================== CALENDAR EVENT LISTENERS ====================
 prevMonthBtn.addEventListener('click', () => {

@@ -3,9 +3,31 @@ import sqlite3
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, 'reminders.db')
+UNCATEGORIZED_LABEL = 'Sin categoría'
 
 def get_connection():
     return sqlite3.connect(DB_PATH)
+
+
+def normalize_note_category(category):
+    """Normaliza una categoría de nota para persistencia y vistas."""
+    if category is None:
+        return None
+
+    normalized = str(category).strip()
+    if not normalized:
+        return None
+
+    return normalized
+
+
+def ensure_notes_category_column(cursor):
+    """Agrega la columna category a notes si aún no existe."""
+    cursor.execute('PRAGMA table_info(notes)')
+    columns = [column[1] for column in cursor.fetchall()]
+
+    if 'category' not in columns:
+        cursor.execute('ALTER TABLE notes ADD COLUMN category TEXT DEFAULT NULL')
 
 def init_db():
     conn = get_connection()
@@ -33,11 +55,13 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             content TEXT NOT NULL,
+            category TEXT DEFAULT NULL,
             image_file_id TEXT DEFAULT NULL,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    ensure_notes_category_column(cursor)
     conn.commit()
     conn.close()
 
@@ -199,34 +223,83 @@ def get_today_reminders(user_id):
     return rows
 
 # --- FUNCIONES DE NOTAS ---
-def create_note(user_id, content, image_file_id=None):
+def create_note(user_id, content, image_file_id=None, category=None):
     """Crea una nueva nota para el usuario, opcionalmente con imagen."""
     conn = get_connection()
     cursor = conn.cursor()
+    normalized_category = normalize_note_category(category)
     cursor.execute(
-        'INSERT INTO notes (user_id, content, image_file_id) VALUES (?, ?, ?)',
-        (user_id, content, image_file_id)
+        'INSERT INTO notes (user_id, content, category, image_file_id) VALUES (?, ?, ?, ?)',
+        (user_id, content, normalized_category, image_file_id)
     )
     conn.commit()
     conn.close()
 
-def get_notes_by_user(user_id):
-    """Retorna todas las notas de un usuario, incluyendo image_file_id."""
+def get_notes_by_user(user_id, category=None):
+    """Retorna las notas de un usuario, opcionalmente filtradas por categoría."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    normalized_category = normalize_note_category(category)
+
+    if category is None:
+        cursor.execute(
+            'SELECT id, content, category, created_at, updated_at, image_file_id FROM notes WHERE user_id = ? ORDER BY created_at DESC',
+            (user_id,)
+        )
+    elif normalized_category is None or normalized_category.lower() == UNCATEGORIZED_LABEL.lower():
+        cursor.execute(
+            '''
+            SELECT id, content, category, created_at, updated_at, image_file_id
+            FROM notes
+            WHERE user_id = ? AND (category IS NULL OR TRIM(category) = '' OR lower(category) = lower(?))
+            ORDER BY created_at DESC
+            ''',
+            (user_id, UNCATEGORIZED_LABEL)
+        )
+    else:
+        cursor.execute(
+            '''
+            SELECT id, content, category, created_at, updated_at, image_file_id
+            FROM notes
+            WHERE user_id = ? AND lower(category) = lower(?)
+            ORDER BY created_at DESC
+            ''',
+            (user_id, normalized_category)
+        )
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def get_note_categories_by_user(user_id):
+    """Retorna las categorías del usuario con su cantidad de notas."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        'SELECT id, content, created_at, updated_at, image_file_id FROM notes WHERE user_id = ? ORDER BY created_at DESC',
-        (user_id,)
+        '''
+        SELECT
+            COALESCE(NULLIF(TRIM(category), ''), ?) AS category,
+            COUNT(*) AS note_count,
+            MAX(updated_at) AS last_updated_at
+        FROM notes
+        WHERE user_id = ?
+        GROUP BY COALESCE(NULLIF(TRIM(category), ''), ?)
+        ORDER BY lower(COALESCE(NULLIF(TRIM(category), ''), ?)) ASC
+        ''',
+        (UNCATEGORIZED_LABEL, user_id, UNCATEGORIZED_LABEL, UNCATEGORIZED_LABEL)
     )
     rows = cursor.fetchall()
     conn.close()
     return rows
 
-def update_note(note_id, new_content):
-    """Actualiza el contenido de una nota y su fecha de modificación."""
+def update_note(note_id, new_content, category=None):
+    """Actualiza el contenido y la categoría de una nota."""
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute('UPDATE notes SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', (new_content, note_id))
+    normalized_category = normalize_note_category(category)
+    cursor.execute(
+        'UPDATE notes SET content = ?, category = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+        (new_content, normalized_category, note_id)
+    )
     success = cursor.rowcount > 0
     conn.commit()
     conn.close()

@@ -342,11 +342,74 @@ button.danger:active {
 }
 
 /* ==================== NOTES VIEW ==================== */
+.categories-list,
 .notes-list {
     display: flex;
     flex-direction: column;
     gap: 12px;
     animation: slideUp 0.3s ease-out;
+}
+
+.category-card {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    width: 100%;
+    padding: 16px;
+    border-radius: 14px;
+    border: 1px solid var(--border-color);
+    background: linear-gradient(135deg, var(--secondary-bg-color), rgba(36, 129, 204, 0.08));
+    color: var(--text-color);
+    text-align: left;
+    animation: slideUp 0.3s ease-out;
+}
+
+.category-card:active {
+    transform: scale(0.98);
+}
+
+.category-card-main {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+}
+
+.category-name {
+    font-size: 16px;
+    font-weight: 700;
+}
+
+.category-count,
+.category-card-meta {
+    font-size: 13px;
+    color: var(--hint-color);
+}
+
+.category-notes-header {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 16px;
+    animation: slideUp 0.3s ease-out;
+}
+
+.category-notes-header h2 {
+    font-size: 22px;
+    margin: 0;
+}
+
+.category-notes-header p {
+    color: var(--hint-color);
+    font-size: 14px;
+    margin: 4px 0 0;
+}
+
+.back-button {
+    align-self: flex-start;
+    padding: 0;
+    color: var(--link-color);
 }
 
 .note-card {
@@ -368,6 +431,18 @@ button.danger:active {
     margin-bottom: 10px;
     word-break: break-word;
     white-space: pre-wrap;
+}
+
+.note-category-badge {
+    display: inline-flex;
+    align-items: center;
+    margin-bottom: 10px;
+    padding: 6px 10px;
+    border-radius: 999px;
+    background-color: rgba(36, 129, 204, 0.12);
+    color: var(--link-color);
+    font-size: 12px;
+    font-weight: 700;
 }
 
 .note-meta {
@@ -474,6 +549,12 @@ button.danger:active {
     width: 100%;
     min-height: 100px;
     resize: vertical;
+    box-sizing: border-box;
+    margin-bottom: 16px;
+}
+
+.note-edit-modal input {
+    width: 100%;
     box-sizing: border-box;
     margin-bottom: 16px;
 }
