@@ -407,7 +407,7 @@ async def process_github_repository(update: Update, context: ContextTypes.DEFAUL
             "⏳ Obteniendo el código del repositorio con GitIngest..."
         )
 
-        repo_data = ingest_github_repository(url)
+        repo_data = await ingest_github_repository(url)
         repo_chunks = split_repository_content(repo_data['content'])
 
         if not repo_chunks:

@@ -10,10 +10,10 @@ from contextlib import contextmanager
 from urllib.parse import urlsplit
 
 try:
-    from gitingest import ingest
+    from gitingest import ingest_async
     from gitingest.utils.exceptions import InvalidGitHubTokenError
 except ImportError:  # pragma: no cover - depende del entorno de despliegue
-    ingest = None
+    ingest_async = None
 
     class InvalidGitHubTokenError(ValueError):
         pass
@@ -214,9 +214,9 @@ def get_repo_slug(url):
     return f"{path_parts[0]}/{path_parts[1]}"
 
 
-def ingest_github_repository(repo_url):
+async def ingest_github_repository(repo_url):
     """Obtiene el digest completo de un repositorio público usando GitIngest."""
-    if ingest is None:
+    if ingest_async is None:
         raise GitHubRepoDependencyError(
             "GitIngest no está instalado en el entorno del bot. Ejecuta: pip install gitingest"
         )
@@ -230,7 +230,7 @@ def ingest_github_repository(repo_url):
     logger.info("Iniciando ingestión del repositorio GitHub: %s", normalized_url)
     try:
         with _scoped_github_token(token):
-            summary, tree, content = ingest(
+            summary, tree, content = await ingest_async(
                 normalized_url,
                 max_file_size=DEFAULT_MAX_FILE_SIZE,
                 exclude_patterns=DEFAULT_EXCLUDE_PATTERNS,
@@ -241,9 +241,10 @@ def ingest_github_repository(repo_url):
     except Exception as exc:
         classified_error = _classify_ingest_error(exc)
         logger.error(
-            "Error durante la ingestión del repositorio %s: %s",
+            "Error DETALLADO ingestión %s: tipo=%s msg=%s",
             normalized_url,
-            classified_error,
+            type(exc).__name__,
+            str(exc),
             exc_info=True,
         )
         raise classified_error from exc
