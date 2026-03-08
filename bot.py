@@ -13,12 +13,20 @@ from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler, CallbackQueryHandler
 
-from brain import process_user_input, process_notes_query, process_vision_input, process_video_summary
+from brain import (process_user_input, process_notes_query, process_vision_input,
+                   process_video_summary, process_repository_chunk,
+                   synthesize_repository_analysis)
 from database import (add_reminder, get_user_reminders, get_connection, 
                       delete_reminder_by_text, update_reminder_by_id, 
                       set_daily_summary, get_users_with_daily_summary, get_today_reminders,
                       create_note, get_notes_by_user, normalize_note_category, UNCATEGORIZED_LABEL)
 from video_handler import extract_x_url, download_audio, transcribe_audio, cleanup_audio
+from repo_handler import (
+    GitHubRepositoryError,
+    extract_github_repo_url,
+    ingest_github_repository,
+    split_repository_content,
+)
 
 load_dotenv()
 
@@ -382,6 +390,172 @@ async def process_x_video(update: Update, context: ContextTypes.DEFAULT_TYPE, ur
             cleanup_audio(audio_path)
 
 
+async def process_github_repository(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, user_text: str):
+    """Pipeline completo: GitIngest -> análisis por partes -> síntesis final."""
+    user_id = update.effective_user.id
+    status_msg = None
+
+    logging.info(f"Procesando repositorio GitHub para usuario {user_id}: {url}")
+
+    if 'history' not in context.user_data:
+        context.user_data['history'] = []
+
+    history = context.user_data.get('history', [])
+
+    try:
+        status_msg = await update.effective_message.reply_text(
+            "⏳ Obteniendo el código del repositorio con GitIngest..."
+        )
+
+        repo_data = ingest_github_repository(url)
+        repo_chunks = split_repository_content(repo_data['content'])
+
+        if not repo_chunks:
+            await status_msg.edit_text("❌ No encontré contenido utilizable para analizar en ese repositorio.")
+            return
+
+        partial_analyses = []
+        total_chunks = len(repo_chunks)
+
+        for index, chunk in enumerate(repo_chunks, start=1):
+            await status_msg.edit_text(f"🧠 Analizando el repositorio ({index}/{total_chunks})...")
+
+            partial_analysis = process_repository_chunk(
+                repo_data['slug'],
+                repo_data['summary'],
+                repo_data['tree'],
+                chunk,
+                index,
+                total_chunks,
+                history,
+            )
+
+            if partial_analysis:
+                partial_analyses.append(partial_analysis)
+            else:
+                partial_analyses.append(
+                    f"No se pudo obtener un análisis confiable para la parte {index} del repositorio."
+                )
+
+        synthesis_inputs = partial_analyses
+        if len(partial_analyses) > 6:
+            condensed_analyses = []
+            batch_size = 4
+            total_batches = (len(partial_analyses) + batch_size - 1) // batch_size
+
+            for batch_index, start in enumerate(range(0, len(partial_analyses), batch_size), start=1):
+                await status_msg.edit_text(
+                    f"🧩 Consolidando hallazgos intermedios ({batch_index}/{total_batches})..."
+                )
+                batch = partial_analyses[start:start + batch_size]
+                condensed_analysis = synthesize_repository_analysis(
+                    repo_data['slug'],
+                    repo_data['summary'],
+                    repo_data['tree'],
+                    batch,
+                    history,
+                )
+                condensed_analyses.append(condensed_analysis or "\n\n".join(batch[:2]))
+
+            synthesis_inputs = condensed_analyses
+
+        await status_msg.edit_text("🧩 Consolidando la explicación final del repositorio...")
+
+        final_analysis = synthesize_repository_analysis(
+            repo_data['slug'],
+            repo_data['summary'],
+            repo_data['tree'],
+            synthesis_inputs,
+            history,
+        )
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+        if final_analysis:
+            response_text = (
+                f"🐙 Análisis del repositorio GitHub\n"
+                f"📦 {repo_data['slug']}\n"
+                f"🔗 {repo_data['url']}\n\n"
+                f"{final_analysis}"
+            )
+        else:
+            response_text = (
+                "⚠️ No pude consolidar una explicación final completa del repositorio. "
+                "Te comparto los hallazgos parciales obtenidos:\n\n"
+                + "\n\n".join(partial_analyses[:6])
+            )
+
+        if len(response_text) > 4096:
+            chunks = split_message(response_text, 4096)
+            for chunk in chunks:
+                await update.effective_message.reply_text(chunk)
+        else:
+            await update.effective_message.reply_text(response_text)
+
+        extra_text = user_text.replace(url, '').strip() if user_text else ''
+        followup_text = extra_text if extra_text and len(extra_text) > 2 else 'Explícame de qué trata.'
+
+        context.user_data['history'].append({
+            "role": "user",
+            "content": f"[Compartí un repositorio de GitHub: {repo_data['url']}]. {followup_text}"
+        })
+        context.user_data['history'].append({
+            "role": "assistant",
+            "content": json.dumps({
+                "action": "REPO_ANALYSIS",
+                "url": repo_data['url'],
+                "repo": repo_data['slug'],
+                "summary": repo_data['summary'][:1000],
+                "reply": (final_analysis or response_text)[:2000]
+            }, ensure_ascii=False)
+        })
+
+        if len(context.user_data['history']) > 16:
+            context.user_data['history'] = context.user_data['history'][-16:]
+
+        logging.info(f"Repositorio GitHub procesado exitosamente para usuario {user_id}")
+
+    except GitHubRepositoryError as e:
+        logging.warning(
+            "No se pudo analizar el repositorio GitHub para usuario %s: %s",
+            user_id,
+            e,
+            exc_info=True,
+        )
+        if status_msg:
+            try:
+                await status_msg.edit_text(f"❌ {e.user_message}")
+                return
+            except Exception:
+                pass
+
+        if update.effective_message:
+            try:
+                await update.effective_message.reply_text(f"❌ {e.user_message}")
+            except Exception:
+                pass
+    except Exception as e:
+        logging.error(f"Error procesando repositorio GitHub para usuario {user_id}: {e}", exc_info=True)
+        if status_msg:
+            try:
+                await status_msg.edit_text(
+                    "❌ No pude analizar ese repositorio de GitHub en este momento. Intenta de nuevo más tarde."
+                )
+                return
+            except Exception:
+                pass
+        if update.effective_message:
+            try:
+                await update.effective_message.reply_text(
+                    "❌ No pude analizar ese repositorio de GitHub en este momento. Intenta de nuevo más tarde."
+                )
+            except Exception:
+                pass
+
+
 def split_message(text, max_length=4096):
     """Divide un texto largo en chunks que respeten el límite de Telegram.
     
@@ -418,6 +592,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── DETECCIÓN DE ENLACE DE TWITTER / X.COM ──
     # Si el mensaje contiene una URL de X.com/Twitter, mostramos opciones
     if user_text:
+        github_url = extract_github_repo_url(user_text)
+        if github_url:
+            logging.info(f"Enlace de GitHub detectado para usuario {user_id}: {github_url}")
+
+            msg_id = update.message.message_id
+            if 'github_urls' not in context.user_data:
+                context.user_data['github_urls'] = {}
+            context.user_data['github_urls'][str(msg_id)] = {
+                'url': github_url,
+                'text': user_text
+            }
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("🧠 Analizar repositorio", callback_data=f"gh_analyze:{msg_id}"),
+                    InlineKeyboardButton("⏰ Recordatorio", callback_data=f"gh_reminder:{msg_id}")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(
+                "🐙 He detectado un repositorio de GitHub. ¿Qué te gustaría hacer?",
+                reply_markup=reply_markup
+            )
+            return
+
         x_url = extract_x_url(user_text)
         if x_url:
             logging.info(f"Enlace de Twitter/X detectado para usuario {user_id}: {x_url}")
@@ -700,13 +900,19 @@ async def x_link_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             
         action, msg_id = data.split(":", 1)
         
-        x_data = context.user_data.get('x_urls', {}).get(msg_id)
-        if not x_data:
+        if action.startswith("x_"):
+            link_data = context.user_data.get('x_urls', {}).get(msg_id)
+        elif action.startswith("gh_"):
+            link_data = context.user_data.get('github_urls', {}).get(msg_id)
+        else:
+            link_data = None
+
+        if not link_data:
             await query.edit_message_text("❌ Lo siento, la información de este enlace ya no está disponible.")
             return
             
-        url = x_data['url']
-        user_text = x_data['text']
+        url = link_data['url']
+        user_text = link_data['text']
         
         logging.info(f"Callback detectado: {action} para el mensaje {msg_id}")
         
@@ -730,6 +936,22 @@ async def x_link_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             if extra_text and len(extra_text) > 2:
                 instruction = f"Quiero agendar un recordatorio: {extra_text}. Enlace: {url}"
             
+            await process_normal_message(update, context, instruction, user_id)
+        elif action == "gh_analyze":
+            await query.edit_message_text("⏳ Iniciando análisis del repositorio...")
+            await process_github_repository(update, context, url, user_text)
+        elif action == "gh_reminder":
+            await query.edit_message_text("⏳ Preparando tu recordatorio...")
+
+            instruction = (
+                f"Quiero agendar un recordatorio para revisar este repositorio de GitHub: {url}. "
+                "Si no indico claramente cuándo, pregúntame para cuándo quiero el recordatorio."
+            )
+
+            extra_text = user_text.replace(url, '').strip()
+            if extra_text and len(extra_text) > 2:
+                instruction = f"Quiero agendar un recordatorio: {extra_text}. Repositorio GitHub: {url}"
+
             await process_normal_message(update, context, instruction, user_id)
     except Exception as e:
         logging.error(f"Error en x_link_callback_handler: {e}", exc_info=True)
@@ -857,7 +1079,7 @@ if __name__ == '__main__':
         (filters.PHOTO | filters.Document.IMAGE) & filters.CaptionRegex(r'^/nota'),
         nota_photo_command
     ))
-    application.add_handler(CallbackQueryHandler(x_link_callback_handler, pattern=r"^x_"))
+    application.add_handler(CallbackQueryHandler(x_link_callback_handler, pattern=r"^(x_|gh_)"))
     application.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & (~filters.COMMAND), handle_message))
     
     # Programar el revisor cada 60 segundos

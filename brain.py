@@ -36,6 +36,53 @@ def extract_json_from_text(text):
         logger.error(f"Error extrayendo JSON: {e} de texto: {text[:100]}...")
         return None
 
+
+def request_openrouter_text(messages, timeout=60):
+    """Hace una llamada simple a OpenRouter y retorna texto plano."""
+    if not API_KEY:
+        logger.error("ERROR: OPENROUTER_API_KEY no está configurado")
+        return None
+    if not MODEL:
+        logger.error("ERROR: MODEL_NAME no está configurado")
+        return None
+
+    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    data = {
+        "model": MODEL,
+        "messages": messages,
+    }
+
+    try:
+        logger.info(f"Enviando request de texto a OpenRouter con {len(messages)} mensajes")
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=data,
+            timeout=timeout,
+        )
+
+        if response.status_code != 200:
+            logger.error(f"Error en API OpenRouter: Status {response.status_code}, Response: {response.text[:300]}")
+            return None
+
+        response_data = response.json()
+        if 'choices' not in response_data or not response_data['choices']:
+            logger.error(f"Respuesta de API inválida: {response_data}")
+            return None
+
+        content = response_data['choices'][0]['message']['content'].strip()
+        logger.info(f"Respuesta de OpenRouter generada: {len(content)} caracteres")
+        return content
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout al conectar con OpenRouter ({timeout}s)")
+        return None
+    except requests.exceptions.RequestException as re:
+        logger.error(f"Error de conexión con OpenRouter: {re}")
+        return None
+    except Exception as e:
+        logger.error(f"Error inesperado en request_openrouter_text: {e}", exc_info=True)
+        return None
+
 def process_user_input(text, history=None, active_reminders=None):
     # Verificar que las variables de entorno estén configuradas
     if not API_KEY:
@@ -606,3 +653,88 @@ Reglas:
     except Exception as e:
         logger.error(f"Error inesperado en process_video_summary: {e}", exc_info=True)
         return None
+
+
+def process_repository_chunk(repo_slug, repo_summary, repo_tree, chunk_content, chunk_index, total_chunks, history=None):
+    """Analiza una parte del digest de GitIngest y produce hallazgos parciales."""
+    system_prompt = """Eres 'Clusivai', un asistente técnico que analiza repositorios de GitHub.
+El usuario quiere entender de qué trata un repositorio basándote en un digest generado con GitIngest.
+
+Tu tarea es analizar SOLO la parte suministrada y devolver hallazgos parciales útiles para una síntesis posterior.
+
+Reglas:
+- Responde en español.
+- No inventes archivos, tecnologías ni comportamiento que no aparezcan en el digest.
+- Sé concreto y técnico.
+- Devuelve SOLO texto plano.
+- Organiza la respuesta con estas secciones:
+  1. Propósito aparente de esta parte
+  2. Archivos o módulos clave vistos en esta parte
+  3. Flujos o responsabilidades observadas
+  4. Señales de stack, arquitectura o integración
+  5. Dudas o huecos que todavía no se pueden confirmar
+"""
+
+    messages = [{"role": "system", "content": system_prompt}]
+
+    if history:
+        recent_history = history[-4:] if len(history) > 4 else history
+        for msg in recent_history:
+            if isinstance(msg.get("content"), str):
+                messages.append(msg)
+
+    user_content = (
+        f"REPOSITORIO: {repo_slug}\n"
+        f"PARTE: {chunk_index}/{total_chunks}\n\n"
+        f"RESUMEN GITINGEST:\n{repo_summary}\n\n"
+        f"ESTRUCTURA DEL REPOSITORIO:\n{repo_tree[:5000]}\n\n"
+        f"CONTENIDO DE ESTA PARTE:\n{chunk_content}"
+    )
+    messages.append({"role": "user", "content": user_content})
+
+    return request_openrouter_text(messages, timeout=90)
+
+
+def synthesize_repository_analysis(repo_slug, repo_summary, repo_tree, partial_analyses, history=None):
+    """Consolida los análisis parciales en una explicación final detallada."""
+    system_prompt = """Eres 'Clusivai', un asistente técnico que explica repositorios de GitHub en español.
+Has recibido varios análisis parciales del mismo repositorio y debes producir una explicación final detallada.
+
+La respuesta final debe seguir esta estructura:
+1. Qué problema resuelve o qué objetivo parece tener el repositorio.
+2. Cómo está organizado internamente.
+3. Componentes o archivos clave y la responsabilidad de cada uno.
+4. Flujo principal de ejecución o uso.
+5. Stack y servicios externos detectados.
+6. Riesgos, limitaciones o huecos relevantes.
+
+Reglas:
+- Responde en español y en texto plano.
+- Sé detallado, pero evita repetir lo mismo varias veces.
+- Si alguna conclusión no está completamente confirmada, dilo explícitamente.
+- No hables de ti mismo ni del proceso interno de análisis.
+"""
+
+    messages = [{"role": "system", "content": system_prompt}]
+
+    if history:
+        recent_history = history[-4:] if len(history) > 4 else history
+        for msg in recent_history:
+            if isinstance(msg.get("content"), str):
+                messages.append(msg)
+
+    partials_text = "\n\n".join(
+        f"ANÁLISIS PARCIAL {index}:\n{analysis}"
+        for index, analysis in enumerate(partial_analyses, start=1)
+        if analysis
+    )
+
+    user_content = (
+        f"REPOSITORIO: {repo_slug}\n\n"
+        f"RESUMEN GITINGEST:\n{repo_summary}\n\n"
+        f"ESTRUCTURA DEL REPOSITORIO:\n{repo_tree[:7000]}\n\n"
+        f"ANÁLISIS PARCIALES:\n{partials_text}"
+    )
+    messages.append({"role": "user", "content": user_content})
+
+    return request_openrouter_text(messages, timeout=120)

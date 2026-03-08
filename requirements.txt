@@ -1,0 +1,9 @@
+Flask
+Flask-Cors
+gitingest
+python-dateutil
+python-dotenv
+python-telegram-bot[job-queue]
+pytz
+requests
+yt-dlp

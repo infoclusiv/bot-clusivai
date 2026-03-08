@@ -6,11 +6,11 @@ Requires=clusivai-webapp.service
 [Service]
 Type=simple
 User=clusiv
-WorkingDirectory=/home/clusiv/bot-recordatorios/bot-clusivai
-ExecStart=/usr/bin/env bash /home/clusiv/bot-recordatorios/bot-clusivai/start-ngrok.sh
+WorkingDirectory=/home/clusiv/bot-recordatorios
+ExecStart=/usr/bin/env bash /home/clusiv/bot-recordatorios/start-ngrok.sh
 Restart=always
 RestartSec=5
-EnvironmentFile=/home/clusiv/bot-recordatorios/bot-clusivai/.env
+EnvironmentFile=/home/clusiv/bot-recordatorios/.env
 
 [Install]
 WantedBy=multi-user.target
