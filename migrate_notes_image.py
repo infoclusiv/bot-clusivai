@@ -7,12 +7,15 @@ import sqlite3
 import os
 import sys
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, 'reminders.db')
+
 def migrate():
-    if not os.path.exists('reminders.db'):
+    if not os.path.exists(DB_PATH):
         print("✓ BD no existe. Se creará con init_db().")
         return
 
-    conn = sqlite3.connect('reminders.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
     cursor.execute("PRAGMA table_info(notes)")

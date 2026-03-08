@@ -8,15 +8,18 @@ import sqlite3
 import os
 import sys
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, 'reminders.db')
+
 def migrate_db():
     """Agrega la columna image_file_id a la tabla reminders si no existe."""
     
-    if not os.path.exists('reminders.db'):
+    if not os.path.exists(DB_PATH):
         print("✓ Base de datos no existe. Se creará una nueva con init_db().")
         return
     
     try:
-        conn = sqlite3.connect('reminders.db')
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
         # Verificar si la columna ya existe

@@ -4,20 +4,34 @@ import os
 import json
 import requests
 import logging
-from database import update_reminder_by_id, get_user_reminders, delete_reminder_by_id, get_notes_by_user, update_note, delete_note
+from database import get_connection, update_reminder_by_id, get_user_reminders, delete_reminder_by_id, get_notes_by_user, update_note, delete_note
 from dotenv import load_dotenv
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
 CORS(app)
 
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 WEBAPP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'webapp')
+SERVER_HOST = os.getenv('SERVER_HOST', '0.0.0.0')
+SERVER_PORT = int(os.getenv('PORT', os.getenv('SERVER_PORT', '5000')))
 
 @app.route('/')
 def index():
     return send_from_directory(WEBAPP_DIR, 'index.html')
+
+@app.route('/health', methods=['GET'])
+def healthcheck():
+    try:
+        conn = get_connection()
+        conn.execute('SELECT 1')
+        conn.close()
+        return jsonify({"success": True, "status": "ok"})
+    except Exception as e:
+        logging.error(f"Healthcheck failed: {e}")
+        return jsonify({"success": False, "status": "error"}), 500
 
 @app.route('/api/reprogram', methods=['POST'])
 def reprogram():
@@ -40,7 +54,7 @@ def reprogram():
                 "chat_id": user_id,
                 "text": f"✅ ¡Hecho! Recordatorio #{reminder_id} actualizado con éxito:\n📌 {message}\n📅 {new_date}"
             }
-            requests.post(url, json=payload)
+            requests.post(url, json=payload, timeout=10)
             return jsonify({"success": True})
         else:
             return jsonify({"success": False, "error": "Database update failed"}), 500
@@ -66,7 +80,7 @@ def delete_reminder():
                 "chat_id": user_id,
                 "text": f"🗑️ Recordatorio #{reminder_id} eliminado correctamente."
             }
-            requests.post(url, json=payload)
+            requests.post(url, json=payload, timeout=10)
             return jsonify({"success": True})
         else:
             return jsonify({"success": False, "error": "Recordatorio no encontrado o no pertenece al usuario"}), 404
@@ -194,5 +208,5 @@ def remove_note(note_id):
         return jsonify({"success": False, "error": str(e)}), 500
 
 if __name__ == '__main__':
-    # El servidor corre en el puerto 5000 por defecto
-    app.run(host='0.0.0.0', port=5000)
+    logging.info("Starting web app server on %s:%s", SERVER_HOST, SERVER_PORT)
+    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
