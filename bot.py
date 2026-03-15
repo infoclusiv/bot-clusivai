@@ -1,6 +1,7 @@
 import os
 import logging
 import json
+import re
 import urllib.parse
 import pytz
 import logging
@@ -27,6 +28,7 @@ from repo_handler import (
     ingest_github_repository,
     split_repository_content,
 )
+from youtube_handler import get_transcript as get_youtube_transcript, extract_video_id as extract_youtube_video_id
 
 load_dotenv()
 
@@ -35,6 +37,20 @@ VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"
 DEFAULT_MODEL = os.getenv("MODEL_NAME")
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+
+def extract_youtube_url(text: str):
+    """Detecta y extrae una URL de YouTube de un texto."""
+    if not text:
+        return None
+
+    pattern = r'https?://(?:www\.)?(?:youtube\.com/watch\?(?:[^\s]*&)?v=[\w-]+|youtu\.be/[\w-]+)(?:\S*)?'
+    match = re.search(pattern, text)
+    if not match:
+        return None
+
+    youtube_url = match.group(0)
+    return youtube_url if extract_youtube_video_id(youtube_url) else None
 
 
 def build_webapp_url(**params):
@@ -390,6 +406,91 @@ async def process_x_video(update: Update, context: ContextTypes.DEFAULT_TYPE, ur
             cleanup_audio(audio_path)
 
 
+async def process_youtube_video(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, user_text: str):
+    """Pipeline: obtiene transcripcion de YouTube, la analiza y responde al usuario."""
+    user_id = update.effective_user.id
+
+    logging.info(f"Procesando video de YouTube para usuario {user_id}: {url}")
+
+    if 'history' not in context.user_data:
+        context.user_data['history'] = []
+
+    history = context.user_data.get('history', [])
+
+    try:
+        status_msg = await update.effective_message.reply_text(
+            "📄 Obteniendo transcripción del video de YouTube..."
+        )
+
+        transcript, error = get_youtube_transcript(url)
+
+        if transcript is None:
+            await status_msg.edit_text(f"❌ {error}")
+            return
+
+        await status_msg.edit_text("🧠 Analizando el contenido del video...")
+
+        user_instruction = user_text.replace(url, '').strip() or None
+        if user_instruction and len(user_instruction.strip('., ')) < 3:
+            user_instruction = None
+
+        summary = process_video_summary(transcript, user_instruction, history)
+
+        await status_msg.delete()
+
+        if summary:
+            response_text = f"📺 **Análisis del video de YouTube**\n\n{summary}"
+        else:
+            response_text = (
+                "⚠️ No pude generar el análisis automático. "
+                "Aquí tienes la transcripción del video:\n\n"
+                f"📝 _{transcript[:3000]}_"
+            )
+            if len(transcript) > 3000:
+                response_text += "\n\n_(Transcripción truncada)_"
+
+        if len(response_text) > 4096:
+            for chunk in split_message(response_text, 4096):
+                await update.effective_message.reply_text(chunk, parse_mode="Markdown")
+        else:
+            try:
+                await update.effective_message.reply_text(response_text, parse_mode="Markdown")
+            except Exception:
+                await update.effective_message.reply_text(
+                    response_text.replace('*', '').replace('_', '')
+                )
+
+        context.user_data['history'].append({
+            "role": "user",
+            "content": f"[Comparti un video de YouTube: {url}]. {user_instruction or 'Analizalo.'}"
+        })
+        context.user_data['history'].append({
+            "role": "assistant",
+            "content": json.dumps({
+                "action": "YOUTUBE_ANALYSIS",
+                "url": url,
+                "transcript": transcript[:2000],
+                "summary": (summary or "")[:1000],
+                "reply": summary or "Transcripcion enviada directamente."
+            }, ensure_ascii=False)
+        })
+
+        if len(context.user_data['history']) > 16:
+            context.user_data['history'] = context.user_data['history'][-16:]
+
+        logging.info(f"Video de YouTube procesado exitosamente para usuario {user_id}")
+
+    except Exception as e:
+        logging.error(f"Error procesando video de YouTube para usuario {user_id}: {e}", exc_info=True)
+        if update.effective_message:
+            try:
+                await update.effective_message.reply_text(
+                    "❌ Hubo un error inesperado procesando el video. Intenta de nuevo."
+                )
+            except Exception:
+                pass
+
+
 async def process_github_repository(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, user_text: str):
     """Pipeline completo: GitIngest -> análisis por partes -> síntesis final."""
     user_id = update.effective_user.id
@@ -589,9 +690,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text or update.message.caption
     user_id = update.effective_user.id
     
-    # ── DETECCIÓN DE ENLACE DE TWITTER / X.COM ──
-    # Si el mensaje contiene una URL de X.com/Twitter, mostramos opciones
     if user_text:
+        youtube_url = extract_youtube_url(user_text)
+        if youtube_url:
+            logging.info(f"Enlace de YouTube detectado para usuario {user_id}: {youtube_url}")
+
+            msg_id = update.message.message_id
+            if 'youtube_urls' not in context.user_data:
+                context.user_data['youtube_urls'] = {}
+            context.user_data['youtube_urls'][str(msg_id)] = {
+                'url': youtube_url,
+                'text': user_text,
+            }
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("🎬 Analizar Video", callback_data=f"yt_analyze:{msg_id}"),
+                    InlineKeyboardButton("⏰ Recordatorio", callback_data=f"yt_reminder:{msg_id}"),
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(
+                "📺 Detecté un enlace de YouTube. ¿Qué deseas hacer?",
+                reply_markup=reply_markup,
+            )
+            return
+
         github_url = extract_github_repo_url(user_text)
         if github_url:
             logging.info(f"Enlace de GitHub detectado para usuario {user_id}: {github_url}")
@@ -904,6 +1029,8 @@ async def x_link_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             link_data = context.user_data.get('x_urls', {}).get(msg_id)
         elif action.startswith("gh_"):
             link_data = context.user_data.get('github_urls', {}).get(msg_id)
+        elif action.startswith("yt_"):
+            link_data = context.user_data.get('youtube_urls', {}).get(msg_id)
         else:
             link_data = None
 
@@ -951,6 +1078,22 @@ async def x_link_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             extra_text = user_text.replace(url, '').strip()
             if extra_text and len(extra_text) > 2:
                 instruction = f"Quiero agendar un recordatorio: {extra_text}. Repositorio GitHub: {url}"
+
+            await process_normal_message(update, context, instruction, user_id)
+        elif action == "yt_analyze":
+            await query.edit_message_text("⏳ Iniciando análisis del video de YouTube...")
+            await process_youtube_video(update, context, url, user_text)
+        elif action == "yt_reminder":
+            await query.edit_message_text("⏳ Preparando tu recordatorio...")
+
+            instruction = (
+                f"Quiero agendar un recordatorio para revisar este video de YouTube: {url}. "
+                "Si no indico claramente cuándo, pregúntame para cuándo quiero el recordatorio."
+            )
+
+            extra_text = user_text.replace(url, '').strip()
+            if extra_text and len(extra_text) > 2:
+                instruction = f"Quiero agendar un recordatorio: {extra_text}. Video de YouTube: {url}"
 
             await process_normal_message(update, context, instruction, user_id)
     except Exception as e:
@@ -1079,7 +1222,7 @@ if __name__ == '__main__':
         (filters.PHOTO | filters.Document.IMAGE) & filters.CaptionRegex(r'^/nota'),
         nota_photo_command
     ))
-    application.add_handler(CallbackQueryHandler(x_link_callback_handler, pattern=r"^(x_|gh_)"))
+    application.add_handler(CallbackQueryHandler(x_link_callback_handler, pattern=r"^(x_|gh_|yt_)"))
     application.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & (~filters.COMMAND), handle_message))
     
     # Programar el revisor cada 60 segundos

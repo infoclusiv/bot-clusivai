@@ -7,3 +7,4 @@ python-telegram-bot[job-queue]
 pytz
 requests
 yt-dlp
+youtube-transcript-api
