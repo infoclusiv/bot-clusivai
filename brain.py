@@ -554,13 +554,14 @@ Reglas:
         logger.error(f"Error en process_notes_query: {e}", exc_info=True)
         return None
 
-def process_video_summary(transcript, user_instruction=None, history=None):
+def process_video_summary(transcript, user_instruction=None, history=None, video_source="X.com"):
     """Analiza y resume la transcripción de un video usando el LLM de OpenRouter.
     
     Args:
         transcript: Texto transcrito del video.
         user_instruction: Instrucción adicional del usuario (ej: "¿de qué hablan?").
         history: Historial de conversación.
+        video_source: Fuente del video, por ejemplo "X.com" o "YouTube".
     
     Returns:
         String con el resumen/análisis, o None si hay error.
@@ -575,9 +576,15 @@ def process_video_summary(transcript, user_instruction=None, history=None):
     if len(transcript) > max_transcript_chars:
         transcript = transcript[:max_transcript_chars]
         truncated = True
+
+    source_label = (video_source or "video").strip()
+    source_upper = source_label.upper()
+    transcript_origin = "se ha transcrito automaticamente su audio"
+    if source_label.lower() == "youtube":
+        transcript_origin = "se han obtenido automaticamente sus subtitulos/transcripcion"
     
-    system_prompt = """Eres 'Clusivai', un asistente personal inteligente.
-El usuario compartió un video de X.com (Twitter) y se ha transcrito automáticamente su audio.
+    system_prompt = f"""Eres 'Clusivai', un asistente personal inteligente.
+El usuario compartio un video de {source_label} y {transcript_origin}.
 
 Tu tarea es analizar la transcripción y proporcionar:
 
@@ -607,7 +614,7 @@ Reglas:
                 messages.append(msg)
     
     # Construir mensaje del usuario con la transcripción
-    user_content = "TRANSCRIPCIÓN DEL VIDEO DE X.COM:\n"
+    user_content = f"TRANSCRIPCION DEL VIDEO DE {source_upper}:\n"
     user_content += "─" * 40 + "\n"
     user_content += transcript
     user_content += "\n" + "─" * 40

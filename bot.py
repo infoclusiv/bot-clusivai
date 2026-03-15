@@ -28,7 +28,13 @@ from repo_handler import (
     ingest_github_repository,
     split_repository_content,
 )
-from youtube_handler import get_transcript as get_youtube_transcript, extract_video_id as extract_youtube_video_id
+from youtube_handler import (
+    fetch_available_languages as fetch_youtube_available_languages,
+    fetch_transcript_by_lang as fetch_youtube_transcript_by_lang,
+    get_transcript as get_youtube_transcript,
+    extract_video_id as extract_youtube_video_id,
+    select_transcript_language as select_youtube_transcript_language,
+)
 
 load_dotenv()
 
@@ -418,11 +424,32 @@ async def process_youtube_video(update: Update, context: ContextTypes.DEFAULT_TY
     history = context.user_data.get('history', [])
 
     try:
+        video_id = extract_youtube_video_id(url)
+        if not video_id:
+            await update.effective_message.reply_text("❌ No pude extraer el ID del video desde la URL proporcionada.")
+            return
+
         status_msg = await update.effective_message.reply_text(
-            "📄 Obteniendo transcripción del video de YouTube..."
+            "🔎 Consultando subtitulos disponibles en YouTube..."
         )
 
-        transcript, error = get_youtube_transcript(url)
+        languages, error = fetch_youtube_available_languages(video_id)
+        if not languages:
+            await status_msg.edit_text(f"❌ {error}")
+            return
+
+        selected_lang = select_youtube_transcript_language(languages)
+        if not selected_lang:
+            await status_msg.edit_text("❌ No pude determinar automaticamente el idioma de los subtitulos.")
+            return
+
+        await status_msg.edit_text(
+            f"📄 Obteniendo transcripcion del video de YouTube en {selected_lang}..."
+        )
+
+        transcript, error = fetch_youtube_transcript_by_lang(url, selected_lang)
+        if transcript is None:
+            transcript, error = get_youtube_transcript(url, languages=languages)
 
         if transcript is None:
             await status_msg.edit_text(f"❌ {error}")
@@ -434,7 +461,7 @@ async def process_youtube_video(update: Update, context: ContextTypes.DEFAULT_TY
         if user_instruction and len(user_instruction.strip('., ')) < 3:
             user_instruction = None
 
-        summary = process_video_summary(transcript, user_instruction, history)
+        summary = process_video_summary(transcript, user_instruction, history, video_source="YouTube")
 
         await status_msg.delete()
 
@@ -469,6 +496,7 @@ async def process_youtube_video(update: Update, context: ContextTypes.DEFAULT_TY
             "content": json.dumps({
                 "action": "YOUTUBE_ANALYSIS",
                 "url": url,
+                "language": selected_lang,
                 "transcript": transcript[:2000],
                 "summary": (summary or "")[:1000],
                 "reply": summary or "Transcripcion enviada directamente."
