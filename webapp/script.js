@@ -59,6 +59,8 @@ let reminders = [];
 let categories = [];
 let notes = [];
 let currentCategory = null;
+let currentSubcategoryId = null;
+let currentSubcategoryName = null;
 let currentReminderId = reminderId;
 let currentRecurrence = initialRecurrence;
 let activeTab = 'calendar';
@@ -106,6 +108,23 @@ function switchTab(tab) {
     } else if (tab === 'notes') {
         showNotes();
     }
+}
+
+function confirmAction(message) {
+    return new Promise(resolve => {
+        if (tg && typeof tg.showConfirm === 'function') {
+            try {
+                tg.showConfirm(message, (confirmed) => {
+                    resolve(Boolean(confirmed));
+                });
+                return;
+            } catch (err) {
+                console.warn('Falling back to window.confirm:', err);
+            }
+        }
+
+        resolve(window.confirm(message));
+    });
 }
 
 // ==================== CALENDAR VIEW ====================
@@ -278,6 +297,8 @@ async function showNotes() {
     tg.MainButton.hide();
 
     currentCategory = null;
+    currentSubcategoryId = null;
+    currentSubcategoryName = null;
     await fetchCategories();
     renderCategories();
 }
@@ -296,12 +317,15 @@ async function fetchCategories() {
     }
 }
 
-async function fetchNotes(categoryName) {
+async function fetchNotes(categoryName, subcategoryId = null) {
     if (!userId) return;
 
     const params = new URLSearchParams({ user_id: userId });
     if (categoryName !== null && categoryName !== undefined) {
         params.set('category', categoryName);
+    }
+    if (subcategoryId !== null && subcategoryId !== undefined && subcategoryId !== '') {
+        params.set('subcategory_id', subcategoryId);
     }
 
     try {
@@ -313,6 +337,53 @@ async function fetchNotes(categoryName) {
     } catch (err) {
         console.error('Error fetching notes:', err);
         notes = [];
+    }
+}
+
+function findCategory(categoryName) {
+    if (!categoryName) return null;
+    return categories.find(category => category.name.toLowerCase() === categoryName.toLowerCase()) || null;
+}
+
+function findSubcategory(categoryName, subcategoryId) {
+    if (!categoryName || !subcategoryId) return null;
+    const category = findCategory(categoryName);
+    if (!category) return null;
+    return (category.subcategories || []).find(subcategory => String(subcategory.id) === String(subcategoryId)) || null;
+}
+
+function formatCategoryPath(categoryName, subcategoryName = null) {
+    if (!subcategoryName) {
+        return categoryName || uncategorizedLabel;
+    }
+
+    return `${categoryName || uncategorizedLabel} / ${subcategoryName}`;
+}
+
+function buildSubcategoryOptionsMarkup(categoryName, selectedId = null) {
+    const category = findCategory((categoryName || '').trim());
+    const subcategories = category?.subcategories || [];
+    const selectedValue = selectedId === null || selectedId === undefined ? '' : String(selectedId);
+    const optionTags = ['<option value="">Sin subcategoría</option>'];
+
+    subcategories.forEach(subcategory => {
+        const isSelected = String(subcategory.id) === selectedValue ? ' selected' : '';
+        optionTags.push(`<option value="${subcategory.id}"${isSelected}>${escapeHtml(subcategory.name)}</option>`);
+    });
+
+    return optionTags.join('');
+}
+
+function syncSubcategorySelect(selectElement, categoryName, selectedId = null) {
+    const normalizedCategory = (categoryName || '').trim();
+    const category = findCategory(normalizedCategory);
+    const subcategories = category?.subcategories || [];
+
+    selectElement.innerHTML = buildSubcategoryOptionsMarkup(normalizedCategory, selectedId);
+    selectElement.disabled = subcategories.length === 0;
+
+    if (!subcategories.some(subcategory => String(subcategory.id) === String(selectedId))) {
+        selectElement.value = '';
     }
 }
 
@@ -331,33 +402,209 @@ function renderCategories() {
     categoriesEmpty.style.display = 'none';
 
     categories.forEach(category => {
-        const card = document.createElement('button');
+        const card = document.createElement('section');
         card.classList.add('category-card');
-        card.type = 'button';
-        card.innerHTML = `
+
+        const header = document.createElement('div');
+        header.classList.add('category-card-header');
+
+        const openButton = document.createElement('button');
+        openButton.classList.add('category-open-btn');
+        openButton.type = 'button';
+        openButton.innerHTML = `
             <div class="category-card-main">
                 <span class="category-name">${escapeHtml(category.name)}</span>
                 <span class="category-count">${category.note_count} nota${category.note_count === 1 ? '' : 's'}</span>
             </div>
             <div class="category-card-meta">${formatCategoryMeta(category.last_updated_at)}</div>
         `;
-        card.addEventListener('click', () => {
+        openButton.addEventListener('click', () => {
             openCategory(category.name);
         });
+
+        header.appendChild(openButton);
+
+        if (category.name.toLowerCase() !== uncategorizedLabel.toLowerCase()) {
+            const addSubcategoryButton = document.createElement('button');
+            addSubcategoryButton.classList.add('secondary', 'category-action-btn');
+            addSubcategoryButton.type = 'button';
+            addSubcategoryButton.textContent = '+ Subcategoría';
+            addSubcategoryButton.addEventListener('click', () => {
+                openCreateSubcategoryModal(category.name);
+            });
+            header.appendChild(addSubcategoryButton);
+        }
+
+        card.appendChild(header);
+
+        if ((category.subcategories || []).length > 0) {
+            const subcategoriesContainer = document.createElement('div');
+            subcategoriesContainer.classList.add('subcategory-list');
+
+            category.subcategories.forEach(subcategory => {
+                const row = document.createElement('div');
+                row.classList.add('subcategory-row');
+
+                const subcategoryButton = document.createElement('button');
+                subcategoryButton.classList.add('subcategory-open-btn');
+                subcategoryButton.type = 'button';
+                subcategoryButton.innerHTML = `
+                    <span class="subcategory-name">${escapeHtml(subcategory.name)}</span>
+                    <span class="subcategory-meta">${subcategory.note_count} nota${subcategory.note_count === 1 ? '' : 's'}</span>
+                `;
+                subcategoryButton.addEventListener('click', () => {
+                    openCategory(category.name, subcategory.id, subcategory.name);
+                });
+
+                const deleteSubcategoryButton = document.createElement('button');
+                deleteSubcategoryButton.classList.add('subcategory-delete-btn');
+                deleteSubcategoryButton.type = 'button';
+                deleteSubcategoryButton.setAttribute('aria-label', `Eliminar subcategoría ${subcategory.name}`);
+                deleteSubcategoryButton.textContent = 'Eliminar';
+                deleteSubcategoryButton.addEventListener('click', () => {
+                    removeSubcategory(subcategory.id, subcategory.name, deleteSubcategoryButton);
+                });
+
+                row.appendChild(subcategoryButton);
+                row.appendChild(deleteSubcategoryButton);
+                subcategoriesContainer.appendChild(row);
+            });
+
+            card.appendChild(subcategoriesContainer);
+        } else if (category.name.toLowerCase() !== uncategorizedLabel.toLowerCase()) {
+            const hint = document.createElement('p');
+            hint.classList.add('subcategory-empty-hint');
+            hint.textContent = 'Aún no tienes subcategorías en esta categoría.';
+            card.appendChild(hint);
+        }
+
         categoriesList.appendChild(card);
     });
 }
 
-async function openCategory(categoryName) {
+function openModalShell(title, bodyMarkup) {
+    const overlay = document.createElement('div');
+    overlay.classList.add('note-edit-overlay');
+    overlay.innerHTML = `
+        <div class="note-edit-modal">
+            <h3>${escapeHtml(title)}</h3>
+            ${bodyMarkup}
+        </div>
+    `;
+
+    document.body.appendChild(overlay);
+    overlay.addEventListener('click', (event) => {
+        if (event.target === overlay) {
+            overlay.remove();
+        }
+    });
+
+    return overlay;
+}
+
+function openCreateSubcategoryModal(categoryName) {
+    const overlay = openModalShell(
+        'Nueva Subcategoría',
+        `
+            <p class="modal-helper-text">Se creará dentro de <strong>${escapeHtml(categoryName)}</strong>.</p>
+            <label for="create-subcategory-name">Nombre</label>
+            <input id="create-subcategory-name" type="text" maxlength="80" placeholder="Ej. Pendientes" />
+            <div class="modal-buttons">
+                <button class="secondary" id="modal-cancel">Cancelar</button>
+                <button id="modal-save">Crear</button>
+            </div>
+        `
+    );
+
+    const nameInput = overlay.querySelector('#create-subcategory-name');
+    const cancelButton = overlay.querySelector('#modal-cancel');
+    const saveButton = overlay.querySelector('#modal-save');
+    nameInput.focus();
+
+    cancelButton.addEventListener('click', () => {
+        overlay.remove();
+    });
+
+    saveButton.addEventListener('click', async () => {
+        const name = nameInput.value.trim();
+        if (!name) {
+            alert('Escribe un nombre para la subcategoría.');
+            return;
+        }
+
+        saveButton.disabled = true;
+        saveButton.textContent = 'Creando...';
+
+        try {
+            const response = await fetch('/api/notes/subcategories', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ user_id: userId, category: categoryName, name })
+            });
+            const result = await response.json();
+
+            if (!result.success) {
+                alert('Error al crear: ' + (result.error || 'Desconocido'));
+                saveButton.disabled = false;
+                saveButton.textContent = 'Crear';
+                return;
+            }
+
+            overlay.remove();
+            await fetchCategories();
+            renderCategories();
+        } catch (err) {
+            alert('Error de conexión.');
+            saveButton.disabled = false;
+            saveButton.textContent = 'Crear';
+        }
+    });
+}
+
+function removeSubcategory(subcategoryId, subcategoryName, btnElement) {
+    confirmAction(`¿Eliminar la subcategoría "${subcategoryName}"? Las notas asociadas quedarán sin subcategoría.`).then(async (confirmed) => {
+        if (!confirmed) return;
+
+        btnElement.disabled = true;
+        btnElement.textContent = '...';
+
+        try {
+            const response = await fetch(`/api/notes/subcategories/${subcategoryId}?user_id=${userId}`, {
+                method: 'DELETE'
+            });
+            const result = await response.json();
+
+            if (!result.success) {
+                alert('Error al eliminar: ' + (result.error || 'Desconocido'));
+                btnElement.disabled = false;
+                btnElement.textContent = 'Eliminar';
+                return;
+            }
+
+            await fetchCategories();
+            renderCategories();
+        } catch (err) {
+            alert('Error de conexión.');
+            btnElement.disabled = false;
+            btnElement.textContent = 'Eliminar';
+        }
+    });
+}
+
+async function openCategory(categoryName, subcategoryId = null, subcategoryName = null) {
     currentCategory = categoryName || uncategorizedLabel;
-    await fetchNotes(currentCategory);
+    currentSubcategoryId = subcategoryId === null || subcategoryId === undefined ? null : Number(subcategoryId);
+    currentSubcategoryName = subcategoryName || findSubcategory(currentCategory, currentSubcategoryId)?.name || null;
+    await fetchNotes(currentCategory, currentSubcategoryId);
     renderNotes();
 }
 
 function renderNotes() {
     notesCategoriesHeader.style.display = 'none';
+    categoriesList.style.display = 'none';
+    categoriesEmpty.style.display = 'none';
     categoryNotesView.style.display = 'block';
-    currentCategoryTitle.textContent = currentCategory || uncategorizedLabel;
+    currentCategoryTitle.textContent = formatCategoryPath(currentCategory, currentSubcategoryName);
     currentCategorySubtitle.textContent = `${notes.length} nota${notes.length === 1 ? '' : 's'} guardada${notes.length === 1 ? '' : 's'}`;
     notesList.innerHTML = '';
 
@@ -376,8 +623,8 @@ function renderNotes() {
         card.dataset.noteId = note.id;
 
         const dateStr = formatNoteDate(note.created_at);
+        const badgeLabel = formatCategoryPath(note.category || uncategorizedLabel, note.subcategory_name || null);
 
-        // Construir HTML de imagen si existe
         let imageHtml = '';
         if (note.image_file_id) {
             const imgSrc = `/api/telegram-image/${note.image_file_id}`;
@@ -392,7 +639,6 @@ function renderNotes() {
             `;
         }
 
-        // Construir HTML de contenido de texto (ocultar si es solo placeholder de imagen)
         let contentHtml = '';
         const trimmedContent = (note.content || '').trim();
         if (trimmedContent && trimmedContent !== '📸 Imagen') {
@@ -401,7 +647,7 @@ function renderNotes() {
 
         card.innerHTML = `
             ${imageHtml}
-            <div class="note-category-badge">${escapeHtml(note.category || uncategorizedLabel)}</div>
+            <div class="note-category-badge">${escapeHtml(badgeLabel)}</div>
             ${contentHtml}
             <div class="note-meta">
                 <span class="note-date">${dateStr}</span>
@@ -448,45 +694,46 @@ async function editNote(noteId, btnElement) {
 
     const currentContent = (note.content || '').trim() === '📸 Imagen' ? '' : (note.content || '');
     const currentCategoryValue = categoryInputValue(note.category);
-
-    // Create modal overlay
-    const overlay = document.createElement('div');
-    overlay.classList.add('note-edit-overlay');
-    overlay.innerHTML = `
-        <div class="note-edit-modal">
-            <h3>✏️ Editar Nota</h3>
+    const currentSubcategoryValue = note.subcategory_id ? String(note.subcategory_id) : '';
+    const categorySuggestions = categories
+        .map(category => `<option value="${escapeHtml(category.name)}"></option>`)
+        .join('');
+    const overlay = openModalShell(
+        '✏️ Editar Nota',
+        `
             <label for="edit-note-category">Categoría</label>
-            <input id="edit-note-category" type="text" maxlength="80" placeholder="Sin categoría" value="${escapeHtml(currentCategoryValue)}" />
+            <input id="edit-note-category" type="text" list="note-category-options" maxlength="80" placeholder="Sin categoría" value="${escapeHtml(currentCategoryValue)}" />
+            <datalist id="note-category-options">${categorySuggestions}</datalist>
+            <label for="edit-note-subcategory">Subcategoría</label>
+            <select id="edit-note-subcategory">${buildSubcategoryOptionsMarkup(currentCategoryValue, currentSubcategoryValue)}</select>
             <label for="edit-note-content">Contenido</label>
             <textarea id="edit-note-content">${escapeHtml(currentContent)}</textarea>
             <div class="modal-buttons">
                 <button class="secondary" id="modal-cancel">Cancelar</button>
                 <button id="modal-save">Guardar</button>
             </div>
-        </div>
-    `;
-
-    document.body.appendChild(overlay);
+        `
+    );
 
     const textarea = overlay.querySelector('#edit-note-content');
     const categoryInput = overlay.querySelector('#edit-note-category');
+    const subcategorySelect = overlay.querySelector('#edit-note-subcategory');
     textarea.focus();
     textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+    syncSubcategorySelect(subcategorySelect, currentCategoryValue, currentSubcategoryValue);
 
-    // Cancel
+    categoryInput.addEventListener('input', () => {
+        syncSubcategorySelect(subcategorySelect, categoryInput.value);
+    });
+
     overlay.querySelector('#modal-cancel').addEventListener('click', () => {
         overlay.remove();
     });
 
-    // Click outside to cancel
-    overlay.addEventListener('click', (e) => {
-        if (e.target === overlay) overlay.remove();
-    });
-
-    // Save
     overlay.querySelector('#modal-save').addEventListener('click', async () => {
         const newContent = textarea.value.trim();
         const newCategory = categoryInput.value.trim();
+        const newSubcategoryId = subcategorySelect.value || null;
         if (!newContent) return;
 
         const saveBtn = overlay.querySelector('#modal-save');
@@ -497,20 +744,21 @@ async function editNote(noteId, btnElement) {
             const response = await fetch(`/api/notes/${noteId}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ content: newContent, category: newCategory })
+                body: JSON.stringify({ content: newContent, category: newCategory, subcategory_id: newSubcategoryId })
             });
 
             const result = await response.json();
             if (result.success) {
-                const updatedCategory = result.category || uncategorizedLabel;
                 overlay.remove();
                 await fetchCategories();
 
-                if (updatedCategory !== (currentCategory || uncategorizedLabel)) {
-                    currentCategory = updatedCategory;
-                }
+                currentCategory = newCategory || uncategorizedLabel;
+                currentSubcategoryId = newSubcategoryId ? Number(newSubcategoryId) : null;
+                currentSubcategoryName = currentSubcategoryId
+                    ? (findSubcategory(currentCategory, currentSubcategoryId)?.name || null)
+                    : null;
 
-                await fetchNotes(currentCategory);
+                await fetchNotes(currentCategory, currentSubcategoryId);
                 renderNotes();
             } else {
                 alert('Error al guardar: ' + (result.error || 'Desconocido'));
@@ -526,44 +774,44 @@ async function editNote(noteId, btnElement) {
 }
 
 async function deleteNote(noteId, btnElement) {
-    tg.showConfirm("¿Estás seguro de que deseas eliminar esta nota?", async (confirmed) => {
-        if (confirmed) {
-            btnElement.disabled = true;
-            btnElement.textContent = '...';
+    const confirmed = await confirmAction('¿Estás seguro de que deseas eliminar esta nota?');
+    if (!confirmed) return;
 
-            try {
-                const response = await fetch(`/api/notes/${noteId}`, {
-                    method: 'DELETE'
-                });
+    btnElement.disabled = true;
+    btnElement.textContent = '...';
 
-                const result = await response.json();
-                if (result.success) {
-                    // Animate removal
-                    const card = btnElement.closest('.note-card');
-                    card.style.transition = 'all 0.3s ease';
-                    card.style.opacity = '0';
-                    card.style.transform = 'translateX(50px)';
-                    setTimeout(async () => {
-                        await fetchCategories();
-                        await fetchNotes(currentCategory);
-                        renderNotes();
-                    }, 300);
-                } else {
-                    alert('Error al eliminar: ' + (result.error || 'Desconocido'));
-                    btnElement.disabled = false;
-                    btnElement.textContent = '🗑️';
-                }
-            } catch (err) {
-                alert('Error de conexión.');
-                btnElement.disabled = false;
-                btnElement.textContent = '🗑️';
-            }
+    try {
+        const response = await fetch(`/api/notes/${noteId}`, {
+            method: 'DELETE'
+        });
+
+        const result = await response.json();
+        if (result.success) {
+            const card = btnElement.closest('.note-card');
+            card.style.transition = 'all 0.3s ease';
+            card.style.opacity = '0';
+            card.style.transform = 'translateX(50px)';
+            setTimeout(async () => {
+                await fetchCategories();
+                await fetchNotes(currentCategory, currentSubcategoryId);
+                renderNotes();
+            }, 300);
+        } else {
+            alert('Error al eliminar: ' + (result.error || 'Desconocido'));
+            btnElement.disabled = false;
+            btnElement.textContent = '🗑️';
         }
-    });
+    } catch (err) {
+        alert('Error de conexión.');
+        btnElement.disabled = false;
+        btnElement.textContent = '🗑️';
+    }
 }
 
 backToCategoriesButton.addEventListener('click', () => {
     currentCategory = null;
+    currentSubcategoryId = null;
+    currentSubcategoryName = null;
     renderCategories();
 });
 
@@ -646,39 +894,38 @@ saveButton.addEventListener('click', async () => {
     }
 });
 
-deleteButton.addEventListener('click', () => {
-    tg.showConfirm("¿Estás seguro de que deseas eliminar este recordatorio?", async (confirmed) => {
-        if (confirmed) {
-            deleteButton.disabled = true;
-            deleteButton.textContent = "Eliminando...";
+deleteButton.addEventListener('click', async () => {
+    const confirmed = await confirmAction('¿Estás seguro de que deseas eliminar este recordatorio?');
+    if (!confirmed) return;
 
-            try {
-                const response = await fetch('/api/delete', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ user_id: userId, id: currentReminderId })
-                });
+    deleteButton.disabled = true;
+    deleteButton.textContent = "Eliminando...";
 
-                const result = await response.json();
-                if (result.success) {
-                    if (mode === 'calendar' || mode === 'notes') {
-                        tabNav.style.display = 'flex';
-                        switchTab('calendar');
-                    } else {
-                        tg.close();
-                    }
-                } else {
-                    showError('Error al eliminar: ' + (result.error || 'Desconocido'));
-                    deleteButton.disabled = false;
-                    deleteButton.textContent = "Eliminar Recordatorio";
-                }
-            } catch (err) {
-                showError('Error de conexión.');
-                deleteButton.disabled = false;
-                deleteButton.textContent = "Eliminar Recordatorio";
+    try {
+        const response = await fetch('/api/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user_id: userId, id: currentReminderId })
+        });
+
+        const result = await response.json();
+        if (result.success) {
+            if (mode === 'calendar' || mode === 'notes') {
+                tabNav.style.display = 'flex';
+                switchTab('calendar');
+            } else {
+                tg.close();
             }
+        } else {
+            showError('Error al eliminar: ' + (result.error || 'Desconocido'));
+            deleteButton.disabled = false;
+            deleteButton.textContent = "Eliminar Recordatorio";
         }
-    });
+    } catch (err) {
+        showError('Error de conexión.');
+        deleteButton.disabled = false;
+        deleteButton.textContent = "Eliminar Recordatorio";
+    }
 });
 
 cancelButton.addEventListener('click', () => {

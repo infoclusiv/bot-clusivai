@@ -4,7 +4,7 @@ import os
 import json
 import requests
 import logging
-from database import get_connection, update_reminder_by_id, get_user_reminders, delete_reminder_by_id, get_notes_by_user, get_note_categories_by_user, update_note, delete_note, normalize_note_category, UNCATEGORIZED_LABEL
+from database import get_connection, update_reminder_by_id, get_user_reminders, delete_reminder_by_id, get_notes_by_user, get_note_categories_by_user, update_note, delete_note, normalize_note_category, normalize_note_subcategory_id, create_note_subcategory, delete_note_subcategory, UNCATEGORIZED_LABEL
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -160,10 +160,11 @@ def telegram_image_proxy(file_id):
 def get_notes():
     user_id = request.args.get('user_id')
     category = request.args.get('category')
+    subcategory_id = request.args.get('subcategory_id')
     if not user_id:
         return jsonify({"success": False, "error": "Missing user_id"}), 400
     try:
-        notes = get_notes_by_user(user_id, category=category)
+        notes = get_notes_by_user(user_id, category=category, subcategory_id=subcategory_id)
         notes_list = []
         for n in notes:
             normalized_category = normalize_note_category(n[2]) or UNCATEGORIZED_LABEL
@@ -173,13 +174,18 @@ def get_notes():
                 "category": normalized_category,
                 "created_at": n[3],
                 "updated_at": n[4],
-                "image_file_id": n[5] if len(n) > 5 else None
+                "image_file_id": n[5],
+                "subcategory_id": n[6],
+                "subcategory_name": n[7]
             })
         return jsonify({
             "success": True,
             "category": normalize_note_category(category) or (UNCATEGORIZED_LABEL if category is not None else None),
+            "subcategory_id": normalize_note_subcategory_id(subcategory_id),
             "notes": notes_list
         })
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
     except Exception as e:
         logging.error(f"Error in GET /api/notes: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
@@ -194,15 +200,54 @@ def get_note_categories():
     try:
         categories = get_note_categories_by_user(user_id)
         category_list = []
-        for category_name, note_count, last_updated_at in categories:
+        for category_data in categories:
             category_list.append({
-                "name": category_name,
-                "note_count": note_count,
-                "last_updated_at": last_updated_at
+                "name": category_data['name'],
+                "note_count": category_data['note_count'],
+                "last_updated_at": category_data['last_updated_at'],
+                "subcategories": category_data['subcategories']
             })
         return jsonify({"success": True, "categories": category_list})
     except Exception as e:
         logging.error(f"Error in GET /api/notes/categories: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/notes/subcategories', methods=['POST'])
+def add_note_subcategory():
+    data = request.json or {}
+    user_id = data.get('user_id')
+    category = data.get('category')
+    name = data.get('name')
+
+    if not user_id:
+        return jsonify({"success": False, "error": "Missing user_id"}), 400
+
+    try:
+        subcategory = create_note_subcategory(user_id, category, name)
+        return jsonify({"success": True, "subcategory": subcategory}), 201
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        logging.error(f"Error in POST /api/notes/subcategories: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/notes/subcategories/<int:subcategory_id>', methods=['DELETE'])
+def remove_note_subcategory(subcategory_id):
+    user_id = request.args.get('user_id')
+    if not user_id:
+        return jsonify({"success": False, "error": "Missing user_id"}), 400
+
+    try:
+        result = delete_note_subcategory(user_id, subcategory_id)
+        if result is None:
+            return jsonify({"success": False, "error": "Subcategoría no encontrada"}), 404
+        return jsonify({"success": True, "notes_cleared": result['notes_cleared']})
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        logging.error(f"Error in DELETE /api/notes/subcategories/{subcategory_id}: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -211,17 +256,21 @@ def edit_note(note_id):
     data = request.json
     new_content = data.get('content')
     category = data.get('category')
+    subcategory_id = data.get('subcategory_id')
     if not new_content:
         return jsonify({"success": False, "error": "Missing content"}), 400
     try:
-        success = update_note(note_id, new_content, category)
+        success = update_note(note_id, new_content, category, subcategory_id=subcategory_id)
         if success:
             return jsonify({
                 "success": True,
-                "category": normalize_note_category(category) or UNCATEGORIZED_LABEL
+                "category": normalize_note_category(category) or UNCATEGORIZED_LABEL,
+                "subcategory_id": normalize_note_subcategory_id(subcategory_id)
             })
         else:
             return jsonify({"success": False, "error": "Nota no encontrada"}), 404
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
     except Exception as e:
         logging.error(f"Error in PUT /api/notes/{note_id}: {e}")
         return jsonify({"success": False, "error": str(e)}), 500

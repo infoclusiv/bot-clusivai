@@ -4,11 +4,15 @@ Script de migración para agregar columnas faltantes en la base de datos existen
 Actualmente asegura:
 - reminders.image_file_id
 - notes.category
+- notes.subcategory_id
+- note_subcategories
 """
 
 import sqlite3
 import os
 import sys
+
+from database import ensure_note_subcategories_table, ensure_notes_subcategory_column
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, 'reminders.db')
@@ -55,8 +59,24 @@ def migrate_db():
                 migrated_any = True
             else:
                 print("✓ La columna category ya existe en la tabla notes.")
+
+            if 'subcategory_id' not in note_columns:
+                print("Agregando columna subcategory_id a la tabla notes...")
+                ensure_notes_subcategory_column(cursor)
+                migrated_any = True
+            else:
+                print("✓ La columna subcategory_id ya existe en la tabla notes.")
         else:
             print("✓ La tabla notes no existe todavía. Se creará con init_db().")
+
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='note_subcategories'")
+        subcategories_table_exists = cursor.fetchone() is not None
+        ensure_note_subcategories_table(cursor)
+        if subcategories_table_exists:
+            print("✓ La tabla note_subcategories ya existe.")
+        else:
+            print("Creando tabla note_subcategories...")
+            migrated_any = True
         
         conn.commit()
         conn.close()
