@@ -13,6 +13,11 @@ load_dotenv()
 API_KEY = os.getenv("OPENROUTER_API_KEY")
 MODEL = os.getenv("MODEL_NAME")
 VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"
+REPO_HISTORY_MESSAGES = int(os.getenv("REPO_HISTORY_MESSAGES", "2"))
+REPO_CHUNK_TREE_CHARS = int(os.getenv("REPO_CHUNK_TREE_CHARS", "2500"))
+REPO_SYNTHESIS_TREE_CHARS = int(os.getenv("REPO_SYNTHESIS_TREE_CHARS", "4000"))
+REPO_PARTIAL_MAX_TOKENS = int(os.getenv("REPO_PARTIAL_MAX_TOKENS", "450"))
+REPO_SYNTHESIS_MAX_TOKENS = int(os.getenv("REPO_SYNTHESIS_MAX_TOKENS", "800"))
 
 # Configurar logging para este módulo
 logger = logging.getLogger(__name__)
@@ -37,7 +42,7 @@ def extract_json_from_text(text):
         return None
 
 
-def request_openrouter_text(messages, timeout=60):
+def request_openrouter_text(messages, timeout=60, max_tokens=None):
     """Hace una llamada simple a OpenRouter y retorna texto plano."""
     if not API_KEY:
         logger.error("ERROR: OPENROUTER_API_KEY no está configurado")
@@ -51,6 +56,8 @@ def request_openrouter_text(messages, timeout=60):
         "model": MODEL,
         "messages": messages,
     }
+    if max_tokens is not None:
+        data["max_tokens"] = max_tokens
 
     try:
         logger.info(f"Enviando request de texto a OpenRouter con {len(messages)} mensajes")
@@ -663,29 +670,29 @@ Reglas:
 
 
 def process_repository_chunk(repo_slug, repo_summary, repo_tree, chunk_content, chunk_index, total_chunks, history=None):
-    """Analiza una parte del digest de GitIngest y produce hallazgos parciales."""
+    """Analiza una parte del digest de GitIngest y produce hallazgos parciales compactos."""
     system_prompt = """Eres 'Clusivai', un asistente técnico que analiza repositorios de GitHub.
 El usuario quiere entender de qué trata un repositorio basándote en un digest generado con GitIngest.
 
-Tu tarea es analizar SOLO la parte suministrada y devolver hallazgos parciales útiles para una síntesis posterior.
+Tu tarea es analizar SOLO la parte suministrada y devolver hallazgos parciales compactos y útiles para una síntesis posterior.
 
 Reglas:
 - Responde en español.
 - No inventes archivos, tecnologías ni comportamiento que no aparezcan en el digest.
 - Sé concreto y técnico.
 - Devuelve SOLO texto plano.
-- Organiza la respuesta con estas secciones:
-  1. Propósito aparente de esta parte
-  2. Archivos o módulos clave vistos en esta parte
-  3. Flujos o responsabilidades observadas
-  4. Señales de stack, arquitectura o integración
-  5. Dudas o huecos que todavía no se pueden confirmar
+- Máximo 6 bullets en total.
+- Cada bullet debe ocupar una sola línea y priorizar lo diferencial.
+- Usa exactamente estas 3 secciones:
+    1. Objetivo o responsabilidad visible
+    2. Componentes o flujos detectados
+    3. Stack, integraciones o huecos relevantes
 """
 
     messages = [{"role": "system", "content": system_prompt}]
 
     if history:
-        recent_history = history[-4:] if len(history) > 4 else history
+        recent_history = history[-REPO_HISTORY_MESSAGES:] if len(history) > REPO_HISTORY_MESSAGES else history
         for msg in recent_history:
             if isinstance(msg.get("content"), str):
                 messages.append(msg)
@@ -694,38 +701,37 @@ Reglas:
         f"REPOSITORIO: {repo_slug}\n"
         f"PARTE: {chunk_index}/{total_chunks}\n\n"
         f"RESUMEN GITINGEST:\n{repo_summary}\n\n"
-        f"ESTRUCTURA DEL REPOSITORIO:\n{repo_tree[:5000]}\n\n"
+        f"ESTRUCTURA DEL REPOSITORIO:\n{repo_tree[:REPO_CHUNK_TREE_CHARS]}\n\n"
         f"CONTENIDO DE ESTA PARTE:\n{chunk_content}"
     )
     messages.append({"role": "user", "content": user_content})
 
-    return request_openrouter_text(messages, timeout=90)
+    return request_openrouter_text(messages, timeout=90, max_tokens=REPO_PARTIAL_MAX_TOKENS)
 
 
 def synthesize_repository_analysis(repo_slug, repo_summary, repo_tree, partial_analyses, history=None):
-    """Consolida los análisis parciales en una explicación final detallada."""
+    """Consolida los análisis parciales en una explicación final compacta."""
     system_prompt = """Eres 'Clusivai', un asistente técnico que explica repositorios de GitHub en español.
-Has recibido varios análisis parciales del mismo repositorio y debes producir una explicación final detallada.
+Has recibido varios análisis parciales del mismo repositorio y debes producir una explicación final compacta, clara y puntual.
 
 La respuesta final debe seguir esta estructura:
-1. Qué problema resuelve o qué objetivo parece tener el repositorio.
-2. Cómo está organizado internamente.
-3. Componentes o archivos clave y la responsabilidad de cada uno.
-4. Flujo principal de ejecución o uso.
-5. Stack y servicios externos detectados.
-6. Riesgos, limitaciones o huecos relevantes.
+1. Qué hace el repositorio o qué problema resuelve.
+2. Cómo está organizado y cuáles son sus componentes principales.
+3. Stack, integraciones y observaciones relevantes.
 
 Reglas:
 - Responde en español y en texto plano.
-- Sé detallado, pero evita repetir lo mismo varias veces.
-- Si alguna conclusión no está completamente confirmada, dilo explícitamente.
+- Máximo 8 bullets en total.
+- Cada bullet debe ocupar una sola línea.
+- Evita repetir hallazgos entre secciones.
+- Si una conclusión no está totalmente confirmada, indícalo en una frase corta.
 - No hables de ti mismo ni del proceso interno de análisis.
 """
 
     messages = [{"role": "system", "content": system_prompt}]
 
     if history:
-        recent_history = history[-4:] if len(history) > 4 else history
+        recent_history = history[-REPO_HISTORY_MESSAGES:] if len(history) > REPO_HISTORY_MESSAGES else history
         for msg in recent_history:
             if isinstance(msg.get("content"), str):
                 messages.append(msg)
@@ -739,9 +745,9 @@ Reglas:
     user_content = (
         f"REPOSITORIO: {repo_slug}\n\n"
         f"RESUMEN GITINGEST:\n{repo_summary}\n\n"
-        f"ESTRUCTURA DEL REPOSITORIO:\n{repo_tree[:7000]}\n\n"
+        f"ESTRUCTURA DEL REPOSITORIO:\n{repo_tree[:REPO_SYNTHESIS_TREE_CHARS]}\n\n"
         f"ANÁLISIS PARCIALES:\n{partials_text}"
     )
     messages.append({"role": "user", "content": user_content})
 
-    return request_openrouter_text(messages, timeout=120)
+    return request_openrouter_text(messages, timeout=120, max_tokens=REPO_SYNTHESIS_MAX_TOKENS)

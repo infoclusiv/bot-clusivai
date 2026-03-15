@@ -1,8 +1,11 @@
 import os
+import multiprocessing
 import logging
 import json
+import queue
 import re
 import urllib.parse
+import uuid
 import pytz
 import logging
 import json
@@ -14,20 +17,14 @@ from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler, CallbackQueryHandler
 
-from brain import (process_user_input, process_notes_query, process_vision_input,
-                   process_video_summary, process_repository_chunk,
-                   synthesize_repository_analysis)
+from brain import process_user_input, process_notes_query, process_vision_input, process_video_summary
 from database import (add_reminder, get_user_reminders, get_connection, 
                       delete_reminder_by_text, update_reminder_by_id, 
                       set_daily_summary, get_users_with_daily_summary, get_today_reminders,
                       create_note, get_notes_by_user, normalize_note_category, UNCATEGORIZED_LABEL)
+from repo_analysis_worker import run_repository_analysis_worker
 from video_handler import extract_x_url, download_audio, transcribe_audio, cleanup_audio
-from repo_handler import (
-    GitHubRepositoryError,
-    extract_github_repo_url,
-    ingest_github_repository,
-    split_repository_content,
-)
+from repo_handler import extract_github_repo_url
 from youtube_handler import (
     fetch_available_languages as fetch_youtube_available_languages,
     fetch_transcript_by_lang as fetch_youtube_transcript_by_lang,
@@ -43,6 +40,192 @@ VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"
 DEFAULT_MODEL = os.getenv("MODEL_NAME")
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+
+ACTIVE_REPO_ANALYSES_KEY = 'active_repo_analyses'
+ACTIVE_REPO_ANALYSIS_BY_USER_KEY = 'active_repo_analysis_by_user'
+
+
+def build_repo_cancel_markup(analysis_id: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancelar análisis", callback_data=f"gh_cancel:{analysis_id}")]
+    ])
+
+
+def get_active_repo_analyses(application):
+    return application.bot_data.setdefault(ACTIVE_REPO_ANALYSES_KEY, {})
+
+
+def get_active_repo_analysis_by_user(application):
+    return application.bot_data.setdefault(ACTIVE_REPO_ANALYSIS_BY_USER_KEY, {})
+
+
+def stop_repo_analysis_process(state):
+    process = state.get('process')
+    if not process:
+        return
+
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=1)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=1)
+
+    progress_queue = state.get('queue')
+    if progress_queue is not None:
+        try:
+            progress_queue.close()
+        except Exception:
+            pass
+        try:
+            progress_queue.join_thread()
+        except Exception:
+            pass
+
+
+def remove_repo_analysis_state(application, analysis_id: str, *, stop_process: bool):
+    analyses = get_active_repo_analyses(application)
+    state = analyses.pop(analysis_id, None)
+    if not state:
+        return None
+
+    by_user = get_active_repo_analysis_by_user(application)
+    user_id = state.get('user_id')
+    if by_user.get(user_id) == analysis_id:
+        by_user.pop(user_id, None)
+
+    if stop_process:
+        stop_repo_analysis_process(state)
+
+    return state
+
+
+async def update_repo_status_message(bot, state, text, reply_markup=None):
+    if state.get('last_status_text') == text and state.get('last_status_has_markup') == bool(reply_markup):
+        return
+
+    try:
+        await bot.edit_message_text(
+            chat_id=state['chat_id'],
+            message_id=state['status_message_id'],
+            text=text,
+            reply_markup=reply_markup,
+        )
+        state['last_status_text'] = text
+        state['last_status_has_markup'] = bool(reply_markup)
+    except Exception as exc:
+        logging.warning("No se pudo actualizar el estado del análisis %s: %s", state['analysis_id'], exc)
+
+
+async def finish_repo_analysis(context: ContextTypes.DEFAULT_TYPE, analysis_id: str, result: dict):
+    application = context.application
+    state = remove_repo_analysis_state(application, analysis_id, stop_process=True)
+    if not state:
+        return
+
+    status = result.get('status')
+    if status == 'completed':
+        await update_repo_status_message(context.bot, state, "✅ Análisis del repositorio finalizado.")
+
+        response_text = result.get('response_text') or "⚠️ El análisis terminó sin contenido para mostrar."
+        if len(response_text) > 4096:
+            for chunk in split_message(response_text, 4096):
+                await context.bot.send_message(chat_id=state['chat_id'], text=chunk)
+        else:
+            await context.bot.send_message(chat_id=state['chat_id'], text=response_text)
+
+        user_data = context.application.user_data[state['user_id']]
+        user_data.setdefault('history', [])
+
+        extra_text = state['user_text'].replace(state['url'], '').strip() if state.get('user_text') else ''
+        followup_text = extra_text if extra_text and len(extra_text) > 2 else 'Explícame de qué trata.'
+        repo_data = result.get('repo_data') or {}
+        final_analysis = result.get('final_analysis') or response_text
+
+        user_data['history'].append({
+            "role": "user",
+            "content": f"[Compartí un repositorio de GitHub: {repo_data.get('url', state['url'])}]. {followup_text}"
+        })
+        user_data['history'].append({
+            "role": "assistant",
+            "content": json.dumps({
+                "action": "REPO_ANALYSIS",
+                "url": repo_data.get('url', state['url']),
+                "repo": repo_data.get('slug', ''),
+                "summary": (repo_data.get('summary') or '')[:1000],
+                "reply": final_analysis[:2000]
+            }, ensure_ascii=False)
+        })
+
+        if len(user_data['history']) > 16:
+            user_data['history'] = user_data['history'][-16:]
+
+        logging.info("Repositorio GitHub procesado exitosamente para usuario %s", state['user_id'])
+        return
+
+    error_message = result.get('error_message') or (
+        "No pude analizar ese repositorio de GitHub en este momento. Intenta de nuevo más tarde."
+    )
+    await update_repo_status_message(context.bot, state, f"❌ {error_message}")
+
+
+async def poll_repo_analysis_updates(context: ContextTypes.DEFAULT_TYPE):
+    analyses = list(get_active_repo_analyses(context.application).items())
+
+    for analysis_id, state in analyses:
+        progress_queue = state.get('queue')
+        if progress_queue is None:
+            continue
+
+        while True:
+            try:
+                event = progress_queue.get_nowait()
+            except queue.Empty:
+                break
+            except Exception as exc:
+                logging.error("Error leyendo cola del análisis %s: %s", analysis_id, exc, exc_info=True)
+                await finish_repo_analysis(
+                    context,
+                    analysis_id,
+                    {
+                        'status': 'failed',
+                        'error_message': (
+                            "No pude continuar el análisis del repositorio. Intenta de nuevo más tarde."
+                        ),
+                    },
+                )
+                break
+
+            if event.get('type') == 'progress':
+                await update_repo_status_message(
+                    context.bot,
+                    state,
+                    event.get('text', '⏳ Analizando el repositorio...'),
+                    reply_markup=build_repo_cancel_markup(analysis_id),
+                )
+            elif event.get('type') == 'result':
+                await finish_repo_analysis(context, analysis_id, event)
+                break
+
+        current_state = get_active_repo_analyses(context.application).get(analysis_id)
+        if not current_state:
+            continue
+
+        process = current_state.get('process')
+        if process and not process.is_alive() and current_state.get('status') != 'running':
+            remove_repo_analysis_state(context.application, analysis_id, stop_process=True)
+        elif process and not process.is_alive():
+            await finish_repo_analysis(
+                context,
+                analysis_id,
+                {
+                    'status': 'failed',
+                    'error_message': (
+                        "El análisis del repositorio terminó de forma inesperada. Intenta de nuevo."
+                    ),
+                },
+            )
 
 
 def extract_youtube_url(text: str):
@@ -520,169 +703,124 @@ async def process_youtube_video(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def process_github_repository(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, user_text: str):
-    """Pipeline completo: GitIngest -> análisis por partes -> síntesis final."""
+    """Inicia un análisis de repositorio GitHub en background y lo deja cancelable."""
     user_id = update.effective_user.id
-    status_msg = None
+    application = context.application
+    active_by_user = get_active_repo_analysis_by_user(application)
+    existing_analysis_id = active_by_user.get(user_id)
 
-    logging.info(f"Procesando repositorio GitHub para usuario {user_id}: {url}")
-
-    if 'history' not in context.user_data:
-        context.user_data['history'] = []
-
-    history = context.user_data.get('history', [])
-
-    try:
-        status_msg = await update.effective_message.reply_text(
-            "⏳ Obteniendo el código del repositorio con GitIngest..."
-        )
-
-        repo_data = await ingest_github_repository(url)
-        repo_chunks = split_repository_content(repo_data['content'])
-
-        if not repo_chunks:
-            await status_msg.edit_text("❌ No encontré contenido utilizable para analizar en ese repositorio.")
+    if existing_analysis_id:
+        existing_state = get_active_repo_analyses(application).get(existing_analysis_id)
+        if existing_state:
+            await query_safe_edit_message(
+                update,
+                context,
+                (
+                    "⏳ Ya tienes un análisis de repositorio en curso. "
+                    "Cancélalo primero o espera a que termine."
+                ),
+                reply_markup=build_repo_cancel_markup(existing_analysis_id),
+            )
             return
 
-        partial_analyses = []
-        total_chunks = len(repo_chunks)
+        active_by_user.pop(user_id, None)
 
-        for index, chunk in enumerate(repo_chunks, start=1):
-            await status_msg.edit_text(f"🧠 Analizando el repositorio ({index}/{total_chunks})...")
+    analysis_id = uuid.uuid4().hex[:12]
+    progress_queue = multiprocessing.Queue()
+    history = list(context.user_data.get('history', []))
+    status_message = update.callback_query.message
+    state = {
+        'analysis_id': analysis_id,
+        'user_id': user_id,
+        'chat_id': update.effective_chat.id,
+        'status_message_id': status_message.message_id,
+        'url': url,
+        'user_text': user_text or '',
+        'queue': progress_queue,
+        'status': 'running',
+        'last_status_text': None,
+        'last_status_has_markup': False,
+    }
 
-            partial_analysis = process_repository_chunk(
-                repo_data['slug'],
-                repo_data['summary'],
-                repo_data['tree'],
-                chunk,
-                index,
-                total_chunks,
-                history,
-            )
+    process = multiprocessing.Process(
+        target=run_repository_analysis_worker,
+        args=(url, history, progress_queue),
+        daemon=True,
+    )
+    state['process'] = process
 
-            if partial_analysis:
-                partial_analyses.append(partial_analysis)
-            else:
-                partial_analyses.append(
-                    f"No se pudo obtener un análisis confiable para la parte {index} del repositorio."
-                )
+    get_active_repo_analyses(application)[analysis_id] = state
+    active_by_user[user_id] = analysis_id
 
-        synthesis_inputs = partial_analyses
-        if len(partial_analyses) > 6:
-            condensed_analyses = []
-            batch_size = 4
-            total_batches = (len(partial_analyses) + batch_size - 1) // batch_size
+    try:
+        process.start()
+    except Exception:
+        remove_repo_analysis_state(application, analysis_id, stop_process=True)
+        await query_safe_edit_message(
+            update,
+            context,
+            "❌ No pude iniciar el análisis del repositorio en este momento. Intenta de nuevo más tarde.",
+        )
+        logging.error("No se pudo iniciar el proceso de análisis GitHub %s", analysis_id, exc_info=True)
+        return
 
-            for batch_index, start in enumerate(range(0, len(partial_analyses), batch_size), start=1):
-                await status_msg.edit_text(
-                    f"🧩 Consolidando hallazgos intermedios ({batch_index}/{total_batches})..."
-                )
-                batch = partial_analyses[start:start + batch_size]
-                condensed_analysis = synthesize_repository_analysis(
-                    repo_data['slug'],
-                    repo_data['summary'],
-                    repo_data['tree'],
-                    batch,
-                    history,
-                )
-                condensed_analyses.append(condensed_analysis or "\n\n".join(batch[:2]))
+    logging.info("Análisis GitHub %s iniciado para usuario %s: %s", analysis_id, user_id, url)
 
-            synthesis_inputs = condensed_analyses
+    await update_repo_status_message(
+        context.bot,
+        state,
+        "⏳ Obteniendo el código del repositorio con GitIngest...",
+        reply_markup=build_repo_cancel_markup(analysis_id),
+    )
 
-        await status_msg.edit_text("🧩 Consolidando la explicación final del repositorio...")
 
-        final_analysis = synthesize_repository_analysis(
-            repo_data['slug'],
-            repo_data['summary'],
-            repo_data['tree'],
-            synthesis_inputs,
-            history,
+async def query_safe_edit_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
+    query = update.callback_query
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup)
+    except Exception:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=text,
+            reply_markup=reply_markup,
         )
 
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
 
-        if final_analysis:
-            response_text = (
-                f"🐙 Análisis del repositorio GitHub\n"
-                f"📦 {repo_data['slug']}\n"
-                f"🔗 {repo_data['url']}\n\n"
-                f"{final_analysis}"
-            )
-        else:
-            response_text = (
-                "⚠️ No pude consolidar una explicación final completa del repositorio. "
-                "Te comparto los hallazgos parciales obtenidos:\n\n"
-                + "\n\n".join(partial_analyses[:6])
-            )
-
-        if len(response_text) > 4096:
-            chunks = split_message(response_text, 4096)
-            for chunk in chunks:
-                await update.effective_message.reply_text(chunk)
-        else:
-            await update.effective_message.reply_text(response_text)
-
-        extra_text = user_text.replace(url, '').strip() if user_text else ''
-        followup_text = extra_text if extra_text and len(extra_text) > 2 else 'Explícame de qué trata.'
-
-        context.user_data['history'].append({
-            "role": "user",
-            "content": f"[Compartí un repositorio de GitHub: {repo_data['url']}]. {followup_text}"
-        })
-        context.user_data['history'].append({
-            "role": "assistant",
-            "content": json.dumps({
-                "action": "REPO_ANALYSIS",
-                "url": repo_data['url'],
-                "repo": repo_data['slug'],
-                "summary": repo_data['summary'][:1000],
-                "reply": (final_analysis or response_text)[:2000]
-            }, ensure_ascii=False)
-        })
-
-        if len(context.user_data['history']) > 16:
-            context.user_data['history'] = context.user_data['history'][-16:]
-
-        logging.info(f"Repositorio GitHub procesado exitosamente para usuario {user_id}")
-
-    except GitHubRepositoryError as e:
-        logging.warning(
-            "No se pudo analizar el repositorio GitHub para usuario %s: %s",
-            user_id,
-            e,
-            exc_info=True,
+async def cancel_github_repository_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, analysis_id: str):
+    state = get_active_repo_analyses(context.application).get(analysis_id)
+    if not state:
+        await query_safe_edit_message(
+            update,
+            context,
+            "⚠️ Ese análisis ya no está activo.",
         )
-        if status_msg:
-            try:
-                await status_msg.edit_text(f"❌ {e.user_message}")
-                return
-            except Exception:
-                pass
+        return
 
-        if update.effective_message:
-            try:
-                await update.effective_message.reply_text(f"❌ {e.user_message}")
-            except Exception:
-                pass
-    except Exception as e:
-        logging.error(f"Error procesando repositorio GitHub para usuario {user_id}: {e}", exc_info=True)
-        if status_msg:
-            try:
-                await status_msg.edit_text(
-                    "❌ No pude analizar ese repositorio de GitHub en este momento. Intenta de nuevo más tarde."
-                )
-                return
-            except Exception:
-                pass
-        if update.effective_message:
-            try:
-                await update.effective_message.reply_text(
-                    "❌ No pude analizar ese repositorio de GitHub en este momento. Intenta de nuevo más tarde."
-                )
-            except Exception:
-                pass
+    if state['user_id'] != update.effective_user.id:
+        await query_safe_edit_message(
+            update,
+            context,
+            "❌ No puedes cancelar el análisis de otro usuario.",
+            reply_markup=build_repo_cancel_markup(analysis_id),
+        )
+        return
+
+    state = remove_repo_analysis_state(context.application, analysis_id, stop_process=True)
+    if not state:
+        await query_safe_edit_message(
+            update,
+            context,
+            "⚠️ Ese análisis ya no está activo.",
+        )
+        return
+
+    state['status'] = 'cancelled'
+    await update_repo_status_message(
+        context.bot,
+        state,
+        "❌ Análisis del repositorio cancelado por el usuario.",
+    )
+    logging.info("Análisis GitHub %s cancelado por usuario %s", analysis_id, state['user_id'])
 
 
 def split_message(text, max_length=4096):
@@ -1052,6 +1190,10 @@ async def x_link_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             return
             
         action, msg_id = data.split(":", 1)
+
+        if action == "gh_cancel":
+            await cancel_github_repository_analysis(update, context, msg_id)
+            return
         
         if action.startswith("x_"):
             link_data = context.user_data.get('x_urls', {}).get(msg_id)
@@ -1093,7 +1235,6 @@ async def x_link_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             
             await process_normal_message(update, context, instruction, user_id)
         elif action == "gh_analyze":
-            await query.edit_message_text("⏳ Iniciando análisis del repositorio...")
             await process_github_repository(update, context, url, user_text)
         elif action == "gh_reminder":
             await query.edit_message_text("⏳ Preparando tu recordatorio...")
@@ -1256,6 +1397,7 @@ if __name__ == '__main__':
     # Programar el revisor cada 60 segundos
     job_queue = application.job_queue
     job_queue.run_repeating(check_reminders, interval=60, first=10)
+    job_queue.run_repeating(poll_repo_analysis_updates, interval=1, first=1)
     
     # Programar resumen diario a las 7:45 AM Bogotá (Mon-Fri)
     from datetime import time

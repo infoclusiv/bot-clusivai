@@ -31,6 +31,8 @@ GITHUB_REPO_PATTERN = re.compile(
 )
 
 DEFAULT_MAX_FILE_SIZE = int(os.getenv("GITINGEST_MAX_FILE_SIZE", "200000"))
+DEFAULT_REPO_CHUNK_MAX_CHARS = int(os.getenv("REPO_CHUNK_MAX_CHARS", "24000"))
+DEFAULT_REPO_CHUNK_MAX_FILES = int(os.getenv("REPO_CHUNK_MAX_FILES", "16"))
 DEFAULT_EXCLUDE_PATTERNS = {
     ".git/*",
     "__pycache__/*",
@@ -261,7 +263,11 @@ async def ingest_github_repository(repo_url):
     }
 
 
-def split_repository_content(content, max_chars=18000, max_files_per_chunk=12):
+def split_repository_content(
+    content,
+    max_chars=DEFAULT_REPO_CHUNK_MAX_CHARS,
+    max_files_per_chunk=DEFAULT_REPO_CHUNK_MAX_FILES,
+):
     """Divide el digest en partes manejables, intentando respetar los límites por archivo."""
     if not content:
         return []
