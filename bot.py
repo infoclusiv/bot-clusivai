@@ -11,13 +11,21 @@ import logging
 import json
 import base64
 import requests
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from dateutil import rrule
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler, CallbackQueryHandler
 
-from brain import process_user_input, process_notes_query, process_vision_input, process_video_summary
+from brain import (
+    get_last_brain_failure,
+    is_transient_brain_failure,
+    process_notes_query,
+    process_user_input,
+    process_video_summary,
+    process_vision_input,
+)
 from database import (add_reminder, get_user_reminders, get_connection, 
                       delete_reminder_by_text, update_reminder_by_id, 
                       set_daily_summary, get_users_with_daily_summary, get_today_reminders,
@@ -38,8 +46,42 @@ load_dotenv()
 WEBAPP_URL = os.getenv("PUBLIC_WEBAPP_URL") or os.getenv("WEBAPP_URL")
 VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"
 DEFAULT_MODEL = os.getenv("MODEL_NAME")
+LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", "logs/clusivai-bot.log")
+LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", "1048576"))
+LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "5"))
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+def configure_logging():
+    handlers = [logging.StreamHandler()]
+    resolved_log_path = None
+
+    if LOG_FILE_PATH:
+        resolved_log_path = os.path.abspath(LOG_FILE_PATH)
+        log_directory = os.path.dirname(resolved_log_path)
+        if log_directory:
+            os.makedirs(log_directory, exist_ok=True)
+        handlers.append(
+            RotatingFileHandler(
+                resolved_log_path,
+                maxBytes=LOG_MAX_BYTES,
+                backupCount=LOG_BACKUP_COUNT,
+                encoding="utf-8",
+            )
+        )
+
+    logging.basicConfig(
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        level=logging.INFO,
+        handlers=handlers,
+        force=True,
+    )
+    logging.getLogger(__name__).info(
+        "Logging configurado. Archivo de log=%s",
+        resolved_log_path or "solo stdout/journald",
+    )
+
+
+configure_logging()
 
 
 ACTIVE_REPO_ANALYSES_KEY = 'active_repo_analyses'
@@ -995,10 +1037,27 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
         res = process_user_input(text_to_process, history=history, active_reminders=active_reminders)
         
         if not res:
-            logging.error(f"process_user_input retornó None para usuario {user_id}")
-            await update.effective_message.reply_text("Lo siento, tuve un problema con mi conexión cerebral.")
-            # Limpiar historial ante error para evitar estados corruptos
-            context.user_data['history'] = []
+            failure = get_last_brain_failure()
+            if failure:
+                logging.error(
+                    "process_user_input falló para usuario %s: %s",
+                    user_id,
+                    json.dumps(failure, ensure_ascii=False, default=str),
+                )
+            else:
+                logging.error(f"process_user_input retornó None para usuario {user_id} sin diagnóstico estructurado")
+
+            await update.effective_message.reply_text(
+                "Lo siento, tuve un problema temporal con mi conexión cerebral. Intenta de nuevo en unos segundos."
+            )
+
+            if is_transient_brain_failure(failure):
+                logging.warning(
+                    "Conservando historial para usuario %s porque el fallo fue transitorio",
+                    user_id,
+                )
+            else:
+                context.user_data['history'] = []
             return
         
         logging.info(f"Respuesta de IA para usuario {user_id}: {res}")

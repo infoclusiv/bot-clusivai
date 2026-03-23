@@ -5,6 +5,9 @@ import pytz
 import logging
 import re
 import base64
+import random
+import threading
+import time
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -12,7 +15,17 @@ load_dotenv()
 
 API_KEY = os.getenv("OPENROUTER_API_KEY")
 MODEL = os.getenv("MODEL_NAME")
+DEFAULT_TEXT_MODEL = "stepfun/step-3.5-flash:free"
 VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+TRANSIENT_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+TRANSIENT_FAILURE_KINDS = {"http_status_error", "timeout", "network_error"}
+OPENROUTER_MAX_ATTEMPTS = int(os.getenv("OPENROUTER_MAX_ATTEMPTS", "3"))
+OPENROUTER_RETRY_BASE_SECONDS = float(os.getenv("OPENROUTER_RETRY_BASE_SECONDS", "1.0"))
+OPENROUTER_TEXT_TIMEOUT = int(os.getenv("OPENROUTER_TEXT_TIMEOUT", "60"))
+OPENROUTER_VISION_TIMEOUT = int(os.getenv("OPENROUTER_VISION_TIMEOUT", "90"))
+OPENROUTER_VIDEO_TIMEOUT = int(os.getenv("OPENROUTER_VIDEO_TIMEOUT", "90"))
+OPENROUTER_REPO_TIMEOUT = int(os.getenv("OPENROUTER_REPO_TIMEOUT", "120"))
 REPO_HISTORY_MESSAGES = int(os.getenv("REPO_HISTORY_MESSAGES", "2"))
 REPO_CHUNK_TREE_CHARS = int(os.getenv("REPO_CHUNK_TREE_CHARS", "2500"))
 REPO_SYNTHESIS_TREE_CHARS = int(os.getenv("REPO_SYNTHESIS_TREE_CHARS", "4000"))
@@ -21,6 +34,346 @@ REPO_SYNTHESIS_MAX_TOKENS = int(os.getenv("REPO_SYNTHESIS_MAX_TOKENS", "800"))
 
 # Configurar logging para este módulo
 logger = logging.getLogger(__name__)
+_last_brain_failure = threading.local()
+
+
+def clear_last_brain_failure():
+    _last_brain_failure.data = None
+
+
+def get_last_brain_failure():
+    return getattr(_last_brain_failure, "data", None)
+
+
+def is_transient_brain_failure(failure=None):
+    failure = failure or get_last_brain_failure()
+    return bool(failure and (failure.get("transient") or failure.get("kind") in TRANSIENT_FAILURE_KINDS))
+
+
+def _serialize_preview(value, limit=500):
+    if value is None:
+        return ""
+
+    if isinstance(value, str):
+        return value[:limit]
+
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)[:limit]
+    except (TypeError, ValueError):
+        return str(value)[:limit]
+
+
+def _build_retry_delay(attempt):
+    base_delay = max(0.1, OPENROUTER_RETRY_BASE_SECONDS)
+    return min(base_delay * (2 ** max(0, attempt - 1)) + random.uniform(0, 0.25), 8.0)
+
+
+def _record_brain_failure(kind, context_label, **details):
+    failure = {
+        "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "kind": kind,
+        "context": context_label,
+        **details,
+    }
+    _last_brain_failure.data = failure
+    logger.error(
+        "Diagnóstico brain failure (%s): %s",
+        context_label,
+        json.dumps(failure, ensure_ascii=False, default=str),
+    )
+    return failure
+
+
+def get_openrouter_api_key():
+    return os.getenv("OPENROUTER_API_KEY") or API_KEY
+
+
+def get_text_model():
+    configured_model = os.getenv("MODEL_NAME") or MODEL
+    if configured_model:
+        return configured_model
+
+    logger.warning(
+        "MODEL_NAME no está configurado; usando modelo por defecto %s",
+        DEFAULT_TEXT_MODEL,
+    )
+    return DEFAULT_TEXT_MODEL
+
+
+def build_openrouter_headers(api_key):
+    return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+
+def clean_model_response_text(text):
+    if not isinstance(text, str):
+        return ""
+
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def extract_json_candidates_from_text(text):
+    candidates = []
+    start_index = None
+    depth = 0
+    in_string = False
+    escape = False
+
+    for index, char in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+
+        if char == '{':
+            if depth == 0:
+                start_index = index
+            depth += 1
+        elif char == '}' and depth > 0:
+            depth -= 1
+            if depth == 0 and start_index is not None:
+                candidates.append(text[start_index:index + 1])
+                start_index = None
+
+    return candidates
+
+
+def parse_structured_response(content, *, context_label):
+    cleaned_content = clean_model_response_text(content)
+    if not cleaned_content:
+        logger.error("Respuesta vacía del modelo (%s)", context_label)
+        _record_brain_failure(
+            "empty_model_response",
+            context_label,
+            response_excerpt="",
+            transient=False,
+        )
+        return None
+
+    parse_attempts = [cleaned_content, *extract_json_candidates_from_text(cleaned_content)]
+    seen_attempts = set()
+
+    for candidate in parse_attempts:
+        if candidate in seen_attempts:
+            continue
+        seen_attempts.add(candidate)
+
+        try:
+            parsed_result = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+
+        if not isinstance(parsed_result, dict):
+            logger.warning(
+                "Respuesta JSON con tipo inválido (%s): %s",
+                context_label,
+                type(parsed_result).__name__,
+            )
+            continue
+
+        if parsed_result.get('id') is not None:
+            try:
+                parsed_result['id'] = int(parsed_result['id'])
+            except (ValueError, TypeError):
+                logger.warning("ID no es un número válido (%s): %s", context_label, parsed_result['id'])
+
+        logger.info(
+            "JSON parseado exitosamente (%s): %s",
+            context_label,
+            parsed_result.get('action', 'UNKNOWN'),
+        )
+        return parsed_result
+
+    logger.error(
+        "No se pudo parsear JSON (%s). Contenido: %s...",
+        context_label,
+        cleaned_content[:300],
+    )
+    _record_brain_failure(
+        "invalid_json_response",
+        context_label,
+        response_excerpt=cleaned_content[:300],
+        transient=False,
+    )
+    return None
+
+
+def post_openrouter_chat(data, *, timeout, log_context, max_attempts=None):
+    api_key = get_openrouter_api_key()
+    if not api_key:
+        logger.error("ERROR: OPENROUTER_API_KEY no está configurado")
+        _record_brain_failure(
+            "missing_api_key",
+            log_context,
+            model=data.get("model"),
+            transient=False,
+        )
+        return None
+
+    max_attempts = max_attempts or OPENROUTER_MAX_ATTEMPTS
+    headers = build_openrouter_headers(api_key)
+
+    for attempt in range(1, max_attempts + 1):
+        started_at = time.monotonic()
+        try:
+            logger.info(
+                "Enviando request a OpenRouter (%s), intento %s/%s, modelo=%s",
+                log_context,
+                attempt,
+                max_attempts,
+                data.get('model'),
+            )
+            response = requests.post(
+                OPENROUTER_URL,
+                headers=headers,
+                json=data,
+                timeout=timeout,
+            )
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+
+            logger.info(
+                "Respuesta de OpenRouter (%s), intento %s/%s, modelo=%s, status=%s, duracion_ms=%s",
+                log_context,
+                attempt,
+                max_attempts,
+                data.get('model'),
+                response.status_code,
+                elapsed_ms,
+            )
+
+            if response.status_code != 200:
+                body_preview = response.text[:500]
+                if response.status_code in TRANSIENT_STATUS_CODES and attempt < max_attempts:
+                    sleep_seconds = _build_retry_delay(attempt)
+                    logger.warning(
+                        "OpenRouter devolvió status %s (%s), reintentando en %.2fs. Respuesta: %s",
+                        response.status_code,
+                        log_context,
+                        sleep_seconds,
+                        body_preview,
+                    )
+                    time.sleep(sleep_seconds)
+                    continue
+
+                logger.error(
+                    "Error en API OpenRouter (%s): Status %s, Response: %s",
+                    log_context,
+                    response.status_code,
+                    body_preview,
+                )
+                _record_brain_failure(
+                    "http_status_error",
+                    log_context,
+                    model=data.get("model"),
+                    status_code=response.status_code,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    timeout_seconds=timeout,
+                    duration_ms=elapsed_ms,
+                    response_excerpt=body_preview,
+                    transient=response.status_code in TRANSIENT_STATUS_CODES,
+                )
+                return None
+
+            try:
+                return response.json()
+            except ValueError:
+                logger.error(
+                    "OpenRouter devolvió una respuesta no JSON (%s): %s",
+                    log_context,
+                    response.text[:500],
+                )
+                _record_brain_failure(
+                    "invalid_openrouter_payload",
+                    log_context,
+                    model=data.get("model"),
+                    status_code=response.status_code,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    timeout_seconds=timeout,
+                    duration_ms=elapsed_ms,
+                    response_excerpt=response.text[:500],
+                    transient=False,
+                )
+                return None
+
+        except requests.exceptions.Timeout:
+            if attempt < max_attempts:
+                sleep_seconds = _build_retry_delay(attempt)
+                logger.warning(
+                    "Timeout al conectar con OpenRouter (%ss) (%s), reintentando en %.2fs",
+                    timeout,
+                    log_context,
+                    sleep_seconds,
+                )
+                time.sleep(sleep_seconds)
+                continue
+
+            logger.error("Timeout al conectar con OpenRouter (%ss) (%s)", timeout, log_context)
+            _record_brain_failure(
+                "timeout",
+                log_context,
+                model=data.get("model"),
+                attempt=attempt,
+                max_attempts=max_attempts,
+                timeout_seconds=timeout,
+                transient=True,
+            )
+            return None
+        except requests.exceptions.RequestException as exc:
+            if attempt < max_attempts:
+                sleep_seconds = _build_retry_delay(attempt)
+                logger.warning(
+                    "Error de conexión con OpenRouter (%s), reintentando en %.2fs: %s",
+                    log_context,
+                    sleep_seconds,
+                    exc,
+                )
+                time.sleep(sleep_seconds)
+                continue
+
+            logger.error("Error de conexión con OpenRouter (%s): %s", log_context, exc)
+            _record_brain_failure(
+                "network_error",
+                log_context,
+                model=data.get("model"),
+                attempt=attempt,
+                max_attempts=max_attempts,
+                timeout_seconds=timeout,
+                exception_type=type(exc).__name__,
+                exception_message=str(exc),
+                transient=True,
+            )
+            return None
+        except Exception as exc:
+            logger.error(
+                "Error inesperado al invocar OpenRouter (%s): %s",
+                log_context,
+                exc,
+                exc_info=True,
+            )
+            _record_brain_failure(
+                "unexpected_exception",
+                log_context,
+                model=data.get("model"),
+                attempt=attempt,
+                max_attempts=max_attempts,
+                timeout_seconds=timeout,
+                exception_type=type(exc).__name__,
+                exception_message=str(exc),
+                transient=False,
+            )
+            return None
 
 def extract_json_from_text(text):
     """
@@ -28,13 +381,18 @@ def extract_json_from_text(text):
     Busca el primer '{' y el último '}' para extraer el objeto JSON.
     """
     try:
-        # Buscar el primer { y el último }
+        for json_str in extract_json_candidates_from_text(text):
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                continue
+
         start = text.find('{')
         end = text.rfind('}')
-        
+
         if start == -1 or end == -1 or end <= start:
             return None
-        
+
         json_str = text[start:end+1]
         return json.loads(json_str)
     except (json.JSONDecodeError, ValueError) as e:
@@ -42,62 +400,53 @@ def extract_json_from_text(text):
         return None
 
 
-def request_openrouter_text(messages, timeout=60, max_tokens=None):
+def request_openrouter_text(messages, timeout=OPENROUTER_TEXT_TIMEOUT, max_tokens=None):
     """Hace una llamada simple a OpenRouter y retorna texto plano."""
-    if not API_KEY:
+    clear_last_brain_failure()
+    api_key = get_openrouter_api_key()
+    if not api_key:
         logger.error("ERROR: OPENROUTER_API_KEY no está configurado")
-        return None
-    if not MODEL:
-        logger.error("ERROR: MODEL_NAME no está configurado")
+        _record_brain_failure("missing_api_key", "texto", transient=False)
         return None
 
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
     data = {
-        "model": MODEL,
+        "model": get_text_model(),
         "messages": messages,
     }
     if max_tokens is not None:
         data["max_tokens"] = max_tokens
 
-    try:
-        logger.info(f"Enviando request de texto a OpenRouter con {len(messages)} mensajes")
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=data,
-            timeout=timeout,
+    response_data = post_openrouter_chat(
+        data,
+        timeout=timeout,
+        log_context=f"texto/{len(messages)}_mensajes",
+    )
+    if not response_data:
+        return None
+
+    if 'choices' not in response_data or not response_data['choices']:
+        logger.error(f"Respuesta de API inválida: {response_data}")
+        _record_brain_failure(
+            "invalid_openrouter_payload",
+            f"texto/{len(messages)}_mensajes",
+            model=data.get("model"),
+            response_excerpt=_serialize_preview(response_data),
+            transient=False,
         )
-
-        if response.status_code != 200:
-            logger.error(f"Error en API OpenRouter: Status {response.status_code}, Response: {response.text[:300]}")
-            return None
-
-        response_data = response.json()
-        if 'choices' not in response_data or not response_data['choices']:
-            logger.error(f"Respuesta de API inválida: {response_data}")
-            return None
-
-        content = response_data['choices'][0]['message']['content'].strip()
-        logger.info(f"Respuesta de OpenRouter generada: {len(content)} caracteres")
-        return content
-    except requests.exceptions.Timeout:
-        logger.error(f"Timeout al conectar con OpenRouter ({timeout}s)")
         return None
-    except requests.exceptions.RequestException as re:
-        logger.error(f"Error de conexión con OpenRouter: {re}")
-        return None
-    except Exception as e:
-        logger.error(f"Error inesperado en request_openrouter_text: {e}", exc_info=True)
-        return None
+
+    content = response_data['choices'][0]['message']['content'].strip()
+    logger.info(f"Respuesta de OpenRouter generada: {len(content)} caracteres")
+    return content
 
 def process_user_input(text, history=None, active_reminders=None):
-    # Verificar que las variables de entorno estén configuradas
-    if not API_KEY:
+    clear_last_brain_failure()
+    api_key = get_openrouter_api_key()
+    if not api_key:
         logger.error("ERROR: OPENROUTER_API_KEY no está configurado")
+        _record_brain_failure("missing_api_key", "recordatorios", transient=False)
         return None
-    if not MODEL:
-        logger.error("ERROR: MODEL_NAME no está configurado")
-        return None
+    model = get_text_model()
     
     # Obtener hora actual de Bogotá
     tz_bogota = pytz.timezone('America/Bogota')
@@ -209,7 +558,6 @@ def process_user_input(text, history=None, active_reminders=None):
     - NO necesitas ningún parámetro extra para CONSULTAR_NOTAS, solo pon: {{"action": "CONSULTAR_NOTAS", "reply": ""}}
     """
 
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
     messages = [
         {"role": "system", "content": system_prompt}
     ]
@@ -222,84 +570,37 @@ def process_user_input(text, history=None, active_reminders=None):
     messages.append({"role": "user", "content": text})
     
     data = {
-        "model": MODEL,
+        "model": model,
         "messages": messages
     }
 
-    try:
-        logger.info(f"Enviando request a OpenRouter con {len(messages)} mensajes")
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions", 
-            headers=headers, 
-            json=data,
-            timeout=60  # Aumentado a 60 segundos debido a lentitud en modelos gratuitos
+    response_data = post_openrouter_chat(
+        data,
+        timeout=OPENROUTER_TEXT_TIMEOUT,
+        log_context=f"recordatorios/{len(messages)}_mensajes",
+    )
+    if not response_data:
+        return None
+
+    if 'choices' not in response_data or not response_data['choices']:
+        logger.error(f"Respuesta de API inválida: {response_data}")
+        _record_brain_failure(
+            "invalid_openrouter_payload",
+            f"recordatorios/{len(messages)}_mensajes",
+            model=model,
+            response_excerpt=_serialize_preview(response_data),
+            transient=False,
         )
-        
-        # Verificar si la respuesta fue exitosa
-        if response.status_code != 200:
-            logger.error(f"Error en API OpenRouter: Status {response.status_code}, Response: {response.text}")
-            return None
-        
-        response_data = response.json()
-        
-        # Verificar estructura de la respuesta
-        if 'choices' not in response_data or not response_data['choices']:
-            logger.error(f"Respuesta de API inválida: {response_data}")
-            return None
-        
-        content = response_data['choices'][0]['message']['content']
-        logger.info(f"Respuesta cruda de IA: {content[:200]}...")
-        
-        # Limpieza de formato markdown si la IA lo incluye
-        content = content.replace("```json", "").replace("```", "").strip()
-        
-        # Intentar parsear el JSON con múltiples estrategias
-        parsed_result = None
-        
-        # Estrategia 1: Parseo directo
-        try:
-            parsed_result = json.loads(content)
-            logger.info(f"JSON parseado exitosamente (directo): {parsed_result.get('action', 'UNKNOWN')}")
-        except json.JSONDecodeError:
-            logger.warning(f"Parseo directo falló, intentando extracción...")
-            
-            # Estrategia 2: Extracción con regex
-            parsed_result = extract_json_from_text(content)
-            if parsed_result:
-                logger.info(f"JSON extraído con regex: {parsed_result.get('action', 'UNKNOWN')}")
-        
-        if parsed_result is None:
-            logger.error(f"No se pudo parsear JSON. Contenido: {content[:200]}...")
-            return None
-        
-        # Validación adicional: asegurar que 'id' sea integer si existe
-        if 'id' in parsed_result and parsed_result['id'] is not None:
-            try:
-                parsed_result['id'] = int(parsed_result['id'])
-            except (ValueError, TypeError):
-                logger.warning(f"ID no es un número válido: {parsed_result['id']}")
-        
-        return parsed_result
-            
-    except requests.exceptions.Timeout:
-        logger.error("Timeout al conectar con OpenRouter (60s)")
         return None
-    except requests.exceptions.RequestException as re:
-        logger.error(f"Error de conexión con OpenRouter: {re}")
+
+    content = response_data['choices'][0]['message']['content']
+    logger.info(f"Respuesta cruda de IA: {str(content)[:200]}...")
+
+    parsed_result = parse_structured_response(content, context_label="recordatorios")
+    if parsed_result is None:
         return None
-    except Exception as e:
-        print(f"--- ERROR CRÍTICO EN BRAIN.PY ---")
-        print(f"Tipo de error: {type(e).__name__}")
-        print(f"Mensaje: {e}")
-        # Si hay respuesta de la API, imprimirla
-        if 'response' in locals() and response is not None:
-            try:
-                print(f"Status Code: {response.status_code}")
-                print(f"Respuesta API: {response.text[:500]}...")
-            except Exception as resp_error:
-                print(f"No se pudo leer respuesta: {resp_error}")
-        logger.error(f"Error inesperado procesando IA: {e}", exc_info=True)
-        return None
+
+    return parsed_result
 
 
 def process_vision_input(text, image_base64, history=None, active_reminders=None):
@@ -314,11 +615,15 @@ def process_vision_input(text, image_base64, history=None, active_reminders=None
     Returns:
         Dict con la respuesta parseada o None si hay error
     """
-    if not API_KEY:
+    clear_last_brain_failure()
+    api_key = get_openrouter_api_key()
+    if not api_key:
         logger.error("ERROR: OPENROUTER_API_KEY no está configurado")
+        _record_brain_failure("missing_api_key", "vision", transient=False)
         return None
     if not VISION_MODEL:
         logger.error("ERROR: VISION_MODEL no está configurado")
+        _record_brain_failure("missing_vision_model", "vision", transient=False)
         return None
     
     # Obtener hora actual de Bogotá
@@ -386,8 +691,6 @@ def process_vision_input(text, image_base64, history=None, active_reminders=None
     - Usuario envía imagen y dice "recuérdame revisar esto mañana" → CREATE con message basado en la imagen
     """
 
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
-    
     # Construir mensaje con contenido multimodal (texto + imagen)
     user_content = [
         {"type": "text", "text": text},
@@ -412,68 +715,33 @@ def process_vision_input(text, image_base64, history=None, active_reminders=None
         "messages": messages
     }
 
-    try:
-        logger.info(f"Enviando request a OpenRouter con imagen usando modelo: {VISION_MODEL}")
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions", 
-            headers=headers, 
-            json=data,
-            timeout=90  # Más tiempo para modelos de visión
+    response_data = post_openrouter_chat(
+        data,
+        timeout=OPENROUTER_VISION_TIMEOUT,
+        log_context="vision",
+    )
+    if not response_data:
+        return None
+
+    if 'choices' not in response_data or not response_data['choices']:
+        logger.error(f"Respuesta de API inválida (visión): {response_data}")
+        _record_brain_failure(
+            "invalid_openrouter_payload",
+            "vision",
+            model=VISION_MODEL,
+            response_excerpt=_serialize_preview(response_data),
+            transient=False,
         )
-        
-        if response.status_code != 200:
-            logger.error(f"Error en API OpenRouter (visión): Status {response.status_code}, Response: {response.text}")
-            return None
-        
-        response_data = response.json()
-        
-        if 'choices' not in response_data or not response_data['choices']:
-            logger.error(f"Respuesta de API inválida (visión): {response_data}")
-            return None
-        
-        content = response_data['choices'][0]['message']['content']
-        logger.info(f"Respuesta cruda de IA (visión): {content[:200]}...")
-        
-        # Limpieza de formato markdown
-        content = content.replace("```json", "").replace("```", "").strip()
-        
-        # Intentar parsear el JSON
-        parsed_result = None
-        
-        try:
-            parsed_result = json.loads(content)
-            logger.info(f"JSON parseado exitosamente (visión): {parsed_result.get('action', 'UNKNOWN')}")
-        except json.JSONDecodeError:
-            logger.warning(f"Parseo directo falló (visión), intentando extracción...")
-            parsed_result = extract_json_from_text(content)
-            if parsed_result:
-                logger.info(f"JSON extraído con regex (visión): {parsed_result.get('action', 'UNKNOWN')}")
-        
-        if parsed_result is None:
-            logger.error(f"No se pudo parsear JSON (visión). Contenido: {content[:200]}...")
-            return None
-        
-        # Validación adicional: asegurar que 'id' sea integer si existe
-        if 'id' in parsed_result and parsed_result['id'] is not None:
-            try:
-                parsed_result['id'] = int(parsed_result['id'])
-            except (ValueError, TypeError):
-                logger.warning(f"ID no es un número válido: {parsed_result['id']}")
-        
-        return parsed_result
-            
-    except requests.exceptions.Timeout:
-        logger.error("Timeout al conectar con OpenRouter (visión) (90s)")
         return None
-    except requests.exceptions.RequestException as re:
-        logger.error(f"Error de conexión con OpenRouter (visión): {re}")
+
+    content = response_data['choices'][0]['message']['content']
+    logger.info(f"Respuesta cruda de IA (visión): {str(content)[:200]}...")
+
+    parsed_result = parse_structured_response(content, context_label="vision")
+    if parsed_result is None:
         return None
-    except Exception as e:
-        print(f"--- ERROR CRÍTICO EN PROCESS_VISION_INPUT ---")
-        print(f"Tipo de error: {type(e).__name__}")
-        print(f"Mensaje: {e}")
-        logger.error(f"Error inesperado procesando visión: {e}", exc_info=True)
-        return None
+
+    return parsed_result
 
 
 def process_notes_query(user_query, notes_data, history=None):
@@ -487,9 +755,13 @@ def process_notes_query(user_query, notes_data, history=None):
     Returns:
         String con la respuesta natural, o None si hay error
     """
-    if not API_KEY or not MODEL:
-        logger.error("API_KEY o MODEL no configurados para process_notes_query")
+    clear_last_brain_failure()
+    api_key = get_openrouter_api_key()
+    if not api_key:
+        logger.error("API_KEY no configurada para process_notes_query")
+        _record_brain_failure("missing_api_key", "notas", transient=False)
         return None
+    model = get_text_model()
     
     # Formatear notas como contexto
     if notes_data:
@@ -522,7 +794,6 @@ Reglas:
 - Responde SOLO con texto plano (NO JSON). Tu respuesta se enviará directamente al usuario.
 """
     
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
     messages = [{"role": "system", "content": system_prompt}]
     
     if history:
@@ -530,36 +801,30 @@ Reglas:
     
     messages.append({"role": "user", "content": user_query})
     
-    data = {"model": MODEL, "messages": messages}
-    
-    try:
-        logger.info(f"Enviando consulta de notas a OpenRouter")
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=data,
-            timeout=60
+    data = {"model": model, "messages": messages}
+
+    response_data = post_openrouter_chat(
+        data,
+        timeout=OPENROUTER_TEXT_TIMEOUT,
+        log_context="notas",
+    )
+    if not response_data:
+        return None
+
+    if 'choices' not in response_data or not response_data['choices']:
+        logger.error(f"Respuesta inválida de API (notas): {response_data}")
+        _record_brain_failure(
+            "invalid_openrouter_payload",
+            "notas",
+            model=model,
+            response_excerpt=_serialize_preview(response_data),
+            transient=False,
         )
-        
-        if response.status_code != 200:
-            logger.error(f"Error en API OpenRouter (notas): Status {response.status_code}")
-            return None
-        
-        response_data = response.json()
-        if 'choices' not in response_data or not response_data['choices']:
-            logger.error(f"Respuesta inválida de API (notas): {response_data}")
-            return None
-        
-        content = response_data['choices'][0]['message']['content'].strip()
-        logger.info(f"Respuesta de notas: {content[:100]}...")
-        return content
-        
-    except requests.exceptions.Timeout:
-        logger.error("Timeout en consulta de notas")
         return None
-    except Exception as e:
-        logger.error(f"Error en process_notes_query: {e}", exc_info=True)
-        return None
+
+    content = response_data['choices'][0]['message']['content'].strip()
+    logger.info(f"Respuesta de notas: {content[:100]}...")
+    return content
 
 def process_video_summary(transcript, user_instruction=None, history=None, video_source="X.com"):
     """Analiza y resume la transcripción de un video usando el LLM de OpenRouter.
@@ -573,9 +838,13 @@ def process_video_summary(transcript, user_instruction=None, history=None, video
     Returns:
         String con el resumen/análisis, o None si hay error.
     """
-    if not API_KEY or not MODEL:
-        logger.error("API_KEY o MODEL no configurados para process_video_summary")
+    clear_last_brain_failure()
+    api_key = get_openrouter_api_key()
+    if not api_key:
+        logger.error("API_KEY no configurada para process_video_summary")
+        _record_brain_failure("missing_api_key", "video_summary", transient=False)
         return None
+    model = get_text_model()
     
     # Truncar transcript si es muy largo para no exceder límites del modelo
     max_transcript_chars = 15000  # ~3750 tokens aprox
@@ -609,7 +878,6 @@ Reglas:
 - No incluyas la transcripción completa en tu respuesta, solo el análisis.
 """
 
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
     messages = [{"role": "system", "content": system_prompt}]
     
     # Agregar historial relevante (solo los últimos mensajes para contexto)
@@ -634,39 +902,30 @@ Reglas:
     
     messages.append({"role": "user", "content": user_content})
     
-    data = {"model": MODEL, "messages": messages}
-    
-    try:
-        logger.info(f"Enviando transcripción ({len(transcript)} chars) a OpenRouter para análisis")
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=data,
-            timeout=90
+    data = {"model": model, "messages": messages}
+
+    response_data = post_openrouter_chat(
+        data,
+        timeout=OPENROUTER_VIDEO_TIMEOUT,
+        log_context="video_summary",
+    )
+    if not response_data:
+        return None
+
+    if 'choices' not in response_data or not response_data['choices']:
+        logger.error(f"Respuesta inválida de API (video summary): {response_data}")
+        _record_brain_failure(
+            "invalid_openrouter_payload",
+            "video_summary",
+            model=model,
+            response_excerpt=_serialize_preview(response_data),
+            transient=False,
         )
-        
-        if response.status_code != 200:
-            logger.error(f"Error en API OpenRouter (video summary): Status {response.status_code}, Response: {response.text[:300]}")
-            return None
-        
-        response_data = response.json()
-        if 'choices' not in response_data or not response_data['choices']:
-            logger.error(f"Respuesta inválida de API (video summary): {response_data}")
-            return None
-        
-        content = response_data['choices'][0]['message']['content'].strip()
-        logger.info(f"Resumen de video generado: {len(content)} caracteres")
-        return content
-        
-    except requests.exceptions.Timeout:
-        logger.error("Timeout en solicitud de resumen de video (90s)")
         return None
-    except requests.exceptions.RequestException as re:
-        logger.error(f"Error de conexión en resumen de video: {re}")
-        return None
-    except Exception as e:
-        logger.error(f"Error inesperado en process_video_summary: {e}", exc_info=True)
-        return None
+
+    content = response_data['choices'][0]['message']['content'].strip()
+    logger.info(f"Resumen de video generado: {len(content)} caracteres")
+    return content
 
 
 def process_repository_chunk(repo_slug, repo_summary, repo_tree, chunk_content, chunk_index, total_chunks, history=None):
@@ -706,7 +965,7 @@ Reglas:
     )
     messages.append({"role": "user", "content": user_content})
 
-    return request_openrouter_text(messages, timeout=90, max_tokens=REPO_PARTIAL_MAX_TOKENS)
+    return request_openrouter_text(messages, timeout=OPENROUTER_REPO_TIMEOUT, max_tokens=REPO_PARTIAL_MAX_TOKENS)
 
 
 def synthesize_repository_analysis(repo_slug, repo_summary, repo_tree, partial_analyses, history=None):
@@ -750,4 +1009,4 @@ Reglas:
     )
     messages.append({"role": "user", "content": user_content})
 
-    return request_openrouter_text(messages, timeout=120, max_tokens=REPO_SYNTHESIS_MAX_TOKENS)
+    return request_openrouter_text(messages, timeout=OPENROUTER_REPO_TIMEOUT, max_tokens=REPO_SYNTHESIS_MAX_TOKENS)
