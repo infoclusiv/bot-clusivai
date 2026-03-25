@@ -17,6 +17,8 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 WEBAPP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'webapp')
 SERVER_HOST = os.getenv('SERVER_HOST', '0.0.0.0')
 SERVER_PORT = int(os.getenv('PORT', os.getenv('SERVER_PORT', '5000')))
+LOGS_ACCESS_TOKEN = os.getenv('LOGS_ACCESS_TOKEN', '')
+LOG_FILE_PATH = os.getenv('LOG_FILE_PATH', 'logs/clusivai-bot.log')
 
 @app.route('/')
 def index():
@@ -110,6 +112,62 @@ def get_reminders():
         return jsonify({"success": True, "reminders": reminders_list})
     except Exception as e:
         logging.error(f"Error in /api/reminders: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/logs', methods=['GET'])
+def view_logs():
+    """Devuelve las ultimas lineas del log del bot con filtros simples."""
+    token = request.args.get('token', '')
+    if not LOGS_ACCESS_TOKEN or token != LOGS_ACCESS_TOKEN:
+        return jsonify({"success": False, "error": "Acceso no autorizado"}), 403
+
+    try:
+        lines_requested = int(request.args.get('lines', 200))
+    except (TypeError, ValueError):
+        lines_requested = 200
+
+    lines_requested = max(1, min(lines_requested, 1000))
+    log_level_filter = request.args.get('level', '').upper()
+    search_term = request.args.get('search', '')
+    response_format = request.args.get('format', 'json').lower()
+    resolved_log_path = os.path.abspath(LOG_FILE_PATH)
+
+    if not os.path.exists(resolved_log_path):
+        return jsonify({
+            "success": False,
+            "error": f"Archivo de log no encontrado: {resolved_log_path}"
+        }), 404
+
+    try:
+        with open(resolved_log_path, 'r', encoding='utf-8', errors='replace') as file_handle:
+            all_lines = file_handle.readlines()
+
+        filtered_lines = all_lines
+        if log_level_filter:
+            filtered_lines = [line for line in filtered_lines if f' - {log_level_filter} - ' in line]
+        if search_term:
+            filtered_lines = [line for line in filtered_lines if search_term.lower() in line.lower()]
+
+        recent_lines = filtered_lines[-lines_requested:]
+
+        if response_format == 'text':
+            return Response(''.join(recent_lines), content_type='text/plain; charset=utf-8')
+
+        return jsonify({
+            "success": True,
+            "total_lines": len(all_lines),
+            "filtered_lines": len(filtered_lines),
+            "returned_lines": len(recent_lines),
+            "log_file": resolved_log_path,
+            "filters": {
+                "level": log_level_filter or None,
+                "search": search_term or None,
+            },
+            "lines": [line.rstrip('\n') for line in recent_lines],
+        })
+    except Exception as e:
+        logging.error(f"Error leyendo logs: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/<path:path>')

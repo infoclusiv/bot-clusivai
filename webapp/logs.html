@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clusivai Logs</title>
+    <style>
+        :root {
+            color-scheme: dark;
+            --bg: #0b1220;
+            --panel: rgba(12, 23, 42, 0.88);
+            --panel-strong: rgba(15, 32, 60, 0.96);
+            --line: rgba(148, 163, 184, 0.18);
+            --text: #dbe7ff;
+            --muted: #8ea3c7;
+            --accent: #5eead4;
+            --accent-strong: #14b8a6;
+            --danger: #f87171;
+            --warn: #fbbf24;
+            --info: #60a5fa;
+            --ok: #34d399;
+            --shadow: 0 24px 70px rgba(2, 8, 23, 0.45);
+            --font: "IBM Plex Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            background:
+                radial-gradient(circle at top left, rgba(20, 184, 166, 0.12), transparent 30%),
+                radial-gradient(circle at top right, rgba(96, 165, 250, 0.16), transparent 28%),
+                linear-gradient(180deg, #08101d 0%, #0b1220 45%, #060b14 100%);
+            color: var(--text);
+            font-family: var(--font);
+        }
+
+        .shell {
+            width: min(1180px, calc(100% - 32px));
+            margin: 32px auto;
+            padding: 24px;
+            border: 1px solid var(--line);
+            border-radius: 24px;
+            background: var(--panel);
+            box-shadow: var(--shadow);
+            backdrop-filter: blur(18px);
+        }
+
+        .hero {
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+            align-items: flex-start;
+            margin-bottom: 20px;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: clamp(24px, 4vw, 34px);
+            letter-spacing: -0.04em;
+        }
+
+        .subtitle {
+            margin: 8px 0 0;
+            color: var(--muted);
+            font-size: 14px;
+            max-width: 70ch;
+            line-height: 1.6;
+        }
+
+        .pill {
+            padding: 8px 12px;
+            border-radius: 999px;
+            border: 1px solid rgba(94, 234, 212, 0.28);
+            color: var(--accent);
+            background: rgba(20, 184, 166, 0.12);
+            font-size: 12px;
+            white-space: nowrap;
+        }
+
+        .card {
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            background: var(--panel-strong);
+            padding: 18px;
+        }
+
+        .auth-grid,
+        .controls {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 12px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 6px;
+            color: var(--muted);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        input,
+        select,
+        button {
+            width: 100%;
+            border-radius: 12px;
+            border: 1px solid rgba(148, 163, 184, 0.2);
+            padding: 12px 14px;
+            background: rgba(8, 15, 30, 0.88);
+            color: var(--text);
+            font: inherit;
+        }
+
+        input:focus,
+        select:focus {
+            outline: 2px solid rgba(94, 234, 212, 0.24);
+            border-color: rgba(94, 234, 212, 0.48);
+        }
+
+        button {
+            cursor: pointer;
+            background: linear-gradient(135deg, var(--accent-strong), #0f766e);
+            border: 0;
+            font-weight: 700;
+        }
+
+        button.secondary {
+            background: rgba(15, 23, 42, 0.95);
+            border: 1px solid rgba(148, 163, 184, 0.22);
+            font-weight: 500;
+        }
+
+        .status-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+            margin: 18px 0 12px;
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .status-row strong {
+            color: var(--text);
+        }
+
+        .viewer {
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            overflow: hidden;
+            background: rgba(4, 9, 18, 0.92);
+        }
+
+        .log-toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--line);
+            background: rgba(9, 15, 28, 0.96);
+            font-size: 12px;
+            color: var(--muted);
+        }
+
+        .log-output {
+            max-height: 68vh;
+            overflow: auto;
+            padding: 10px 0;
+        }
+
+        .log-line {
+            padding: 8px 16px;
+            border-left: 3px solid transparent;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.06);
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-size: 12px;
+            line-height: 1.6;
+        }
+
+        .log-line.ERROR {
+            color: #ffd6d6;
+            background: rgba(127, 29, 29, 0.2);
+            border-left-color: var(--danger);
+        }
+
+        .log-line.WARNING {
+            color: #fff0bf;
+            background: rgba(120, 53, 15, 0.18);
+            border-left-color: var(--warn);
+        }
+
+        .log-line.INFO {
+            color: #d7e8ff;
+            background: rgba(30, 64, 175, 0.12);
+            border-left-color: var(--info);
+        }
+
+        .log-line.SUCCESS {
+            color: #d1fae5;
+            background: rgba(6, 95, 70, 0.16);
+            border-left-color: var(--ok);
+        }
+
+        .empty {
+            padding: 26px 16px;
+            text-align: center;
+            color: var(--muted);
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        @media (max-width: 900px) {
+            .auth-grid,
+            .controls {
+                grid-template-columns: 1fr;
+            }
+
+            .hero,
+            .status-row,
+            .log-toolbar {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+
+            .shell {
+                width: min(100% - 20px, 1180px);
+                margin: 10px auto;
+                padding: 16px;
+                border-radius: 18px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <main class="shell">
+        <section class="hero">
+            <div>
+                <h1>Clusivai Logs</h1>
+                <p class="subtitle">
+                    Consulta los eventos recientes del bot, filtra por nivel o texto libre y usa el token de acceso
+                    configurado en el servidor para abrir el endpoint seguro de logs.
+                </p>
+            </div>
+            <div class="pill">/logs protegido por token</div>
+        </section>
+
+        <section class="card" id="auth-card">
+            <div class="auth-grid">
+                <div style="grid-column: span 3;">
+                    <label for="token-input">Token de acceso</label>
+                    <input id="token-input" type="password" placeholder="Ingresa el token configurado en LOGS_ACCESS_TOKEN">
+                </div>
+                <div style="display: flex; align-items: end;">
+                    <button id="connect-button" type="button">Conectar</button>
+                </div>
+            </div>
+        </section>
+
+        <section class="card hidden" id="viewer-card" style="margin-top: 18px;">
+            <div class="controls">
+                <div>
+                    <label for="level-filter">Nivel</label>
+                    <select id="level-filter">
+                        <option value="">Todos</option>
+                        <option value="ERROR">ERROR</option>
+                        <option value="WARNING">WARNING</option>
+                        <option value="INFO">INFO</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="search-filter">Buscar</label>
+                    <input id="search-filter" type="text" placeholder="Ej. BRAIN_FAILURE">
+                </div>
+                <div>
+                    <label for="lines-count">Lineas</label>
+                    <select id="lines-count">
+                        <option value="100">100</option>
+                        <option value="200" selected>200</option>
+                        <option value="500">500</option>
+                        <option value="1000">1000</option>
+                    </select>
+                </div>
+                <div style="display: flex; align-items: end; gap: 10px;">
+                    <button id="refresh-button" type="button">Actualizar</button>
+                </div>
+            </div>
+
+            <div class="status-row">
+                <div id="status-text">Sin datos cargados.</div>
+                <button class="secondary" id="clear-token-button" type="button" style="width: auto;">Olvidar token</button>
+            </div>
+
+            <div class="viewer">
+                <div class="log-toolbar">
+                    <span>Salida reciente del bot</span>
+                    <span id="log-file-path">Ruta de log no disponible</span>
+                </div>
+                <div class="log-output" id="log-container">
+                    <div class="empty">Carga los logs para empezar.</div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <script>
+        const authCard = document.getElementById("auth-card");
+        const viewerCard = document.getElementById("viewer-card");
+        const tokenInput = document.getElementById("token-input");
+        const levelFilter = document.getElementById("level-filter");
+        const searchFilter = document.getElementById("search-filter");
+        const linesCount = document.getElementById("lines-count");
+        const statusText = document.getElementById("status-text");
+        const logFilePath = document.getElementById("log-file-path");
+        const logContainer = document.getElementById("log-container");
+
+        function getSavedToken() {
+            return window.localStorage.getItem("clusivai_logs_token") || "";
+        }
+
+        function saveToken(token) {
+            window.localStorage.setItem("clusivai_logs_token", token);
+        }
+
+        function clearToken() {
+            window.localStorage.removeItem("clusivai_logs_token");
+        }
+
+        function classifyLine(line) {
+            if (line.includes(" - ERROR - ")) return "ERROR";
+            if (line.includes(" - WARNING - ")) return "WARNING";
+            if (line.includes(" - INFO - ")) return "INFO";
+            if (line.includes("finalizado") || line.includes("verificada correctamente")) return "SUCCESS";
+            return "";
+        }
+
+        function renderLines(lines) {
+            logContainer.innerHTML = "";
+
+            if (!Array.isArray(lines) || lines.length === 0) {
+                logContainer.innerHTML = '<div class="empty">No hay lineas para mostrar con los filtros actuales.</div>';
+                return;
+            }
+
+            [...lines].reverse().forEach((line) => {
+                const row = document.createElement("div");
+                row.className = `log-line ${classifyLine(line)}`.trim();
+                row.textContent = line;
+                logContainer.appendChild(row);
+            });
+        }
+
+        async function loadLogs() {
+            const token = tokenInput.value.trim() || getSavedToken();
+            if (!token) {
+                window.alert("Ingresa el token de acceso.");
+                return;
+            }
+
+            saveToken(token);
+            statusText.innerHTML = "Consultando logs...";
+
+            const params = new URLSearchParams({
+                token,
+                lines: linesCount.value,
+                format: "json",
+            });
+
+            if (levelFilter.value) {
+                params.set("level", levelFilter.value);
+            }
+            if (searchFilter.value.trim()) {
+                params.set("search", searchFilter.value.trim());
+            }
+
+            try {
+                const response = await fetch(`/logs?${params.toString()}`);
+                if (response.status === 403) {
+                    statusText.textContent = "Token invalido o acceso no autorizado.";
+                    renderLines([]);
+                    return;
+                }
+
+                const data = await response.json();
+                if (!response.ok || !data.success) {
+                    throw new Error(data.error || "No se pudieron cargar los logs.");
+                }
+
+                authCard.classList.add("hidden");
+                viewerCard.classList.remove("hidden");
+                statusText.innerHTML = `Mostrando <strong>${data.returned_lines}</strong> de <strong>${data.filtered_lines}</strong> lineas filtradas. Total del archivo: <strong>${data.total_lines}</strong>.`;
+                logFilePath.textContent = data.log_file || "Ruta de log no disponible";
+                renderLines(data.lines || []);
+            } catch (error) {
+                statusText.textContent = `Error cargando logs: ${error.message}`;
+                renderLines([]);
+            }
+        }
+
+        document.getElementById("connect-button").addEventListener("click", loadLogs);
+        document.getElementById("refresh-button").addEventListener("click", loadLogs);
+        document.getElementById("clear-token-button").addEventListener("click", () => {
+            clearToken();
+            tokenInput.value = "";
+            viewerCard.classList.add("hidden");
+            authCard.classList.remove("hidden");
+            statusText.textContent = "Token eliminado.";
+            renderLines([]);
+        });
+
+        tokenInput.value = getSavedToken();
+        if (tokenInput.value) {
+            loadLogs();
+        }
+    </script>
+</body>
+</html>

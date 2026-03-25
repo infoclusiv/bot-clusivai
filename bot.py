@@ -326,6 +326,137 @@ def parse_note_category_and_content(raw_text):
 
     return None, content
 
+
+def sanitize_history_for_model(history):
+    """Convierte entradas complejas del historial a texto estable para el modelo."""
+    sanitized = []
+
+    for entry in history or []:
+        if not isinstance(entry, dict):
+            continue
+
+        role = entry.get("role", "")
+        content = entry.get("content", "")
+
+        if role == "assistant" and isinstance(content, str):
+            stripped = content.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    parsed = json.loads(stripped)
+                    action = parsed.get("action", "")
+                    reply = parsed.get("reply", "")
+
+                    if action == "ALERT":
+                        content = (
+                            f"[Alerta enviada - ID: {parsed.get('id', '?')} | "
+                            f"Mensaje: {parsed.get('message', '')}]"
+                        )
+                    elif action in ("VIDEO_ANALYSIS", "YOUTUBE_ANALYSIS", "REPO_ANALYSIS"):
+                        summary = str(parsed.get("summary", "") or reply or "")[:300]
+                        content = (
+                            f"[Analisis completado: {parsed.get('url', '')}. "
+                            f"Resumen: {summary}]"
+                        )
+                    elif reply:
+                        content = str(reply)
+                    else:
+                        content = f"[Accion realizada: {action or 'UNKNOWN'}]"
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+
+        if not isinstance(content, str):
+            try:
+                content = json.dumps(content, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                content = str(content)
+
+        sanitized.append({"role": role, "content": content})
+
+    return sanitized
+
+
+def build_user_brain_error_message(failure):
+    failure = failure or {}
+    failure_kind = failure.get("kind", "")
+    failure_status = failure.get("status_code")
+
+    if failure_kind == "missing_api_key":
+        return "Error de configuracion del bot. Contacta al administrador."
+    if failure_status in (401, 403):
+        return "Hay un problema de autenticacion con el servicio de IA. Contacta al administrador."
+    if failure_status == 402:
+        return "El servicio de IA no tiene creditos disponibles en este momento. Intenta mas tarde."
+    if failure_kind == "timeout":
+        return "El servicio de IA tardo demasiado en responder. Intenta de nuevo en unos segundos."
+    if failure_kind == "network_error":
+        return "Hay un problema de conexion con el servicio de IA. Intenta de nuevo en un momento."
+    if failure_status == 429:
+        return "El servicio de IA esta temporalmente saturado. Espera unos segundos e intenta de nuevo."
+    if failure_status == 503:
+        return "El servicio de IA no esta disponible temporalmente. Intenta de nuevo en unos segundos."
+    if failure_kind in ("invalid_json_response", "invalid_openrouter_payload"):
+        return "No pude interpretar la respuesta del servicio de IA. Intenta reformular tu mensaje."
+    return "Lo siento, tuve un problema temporal con mi conexion cerebral. Intenta de nuevo en unos segundos."
+
+
+def validate_openrouter_key():
+    """Verifica la conectividad basica con OpenRouter al iniciar el bot."""
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key or api_key == "your-openrouter-api-key":
+        logging.error("OPENROUTER_API_KEY no esta configurada o tiene el valor por defecto")
+        return False
+
+    model = DEFAULT_MODEL or "stepfun/step-3.5-flash:free"
+    logging.info("Verificando conexion con OpenRouter. Modelo=%s", model)
+
+    try:
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": "di solo: ok"}],
+                "max_tokens": 5,
+            },
+            timeout=15,
+        )
+    except requests.exceptions.RequestException as exc:
+        logging.warning("No se pudo verificar OpenRouter al iniciar: %s", exc)
+        return True
+
+    if response.status_code == 200:
+        logging.info("Conexion con OpenRouter verificada correctamente")
+        return True
+    if response.status_code == 401:
+        logging.error("OPENROUTER_API_KEY invalida (401 Unauthorized)")
+        return False
+    if response.status_code == 402:
+        logging.error("OpenRouter reporta falta de creditos (402 Payment Required)")
+        return False
+    if response.status_code == 403:
+        logging.error("OpenRouter rechazo la clave o permisos (403 Forbidden)")
+        return False
+    if response.status_code == 429:
+        logging.warning("OpenRouter devolvio 429 al iniciar; el bot continuara")
+        return True
+    if response.status_code in (404, 503):
+        logging.warning(
+            "El modelo %s puede no estar disponible al iniciar (status=%s); el bot continuara",
+            model,
+            response.status_code,
+        )
+        return True
+
+    logging.warning(
+        "OpenRouter respondio con status=%s al iniciar. Respuesta=%s",
+        response.status_code,
+        response.text[:200],
+    )
+    return False
+
 # --- REVISOR DE RECORDATORIOS (Bogotá Time) ---
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     tz_bogota = pytz.timezone('America/Bogota')
@@ -1023,7 +1154,8 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
         logging.info(f"Historial inicializado para usuario {user_id}")
     
     # Recuperar historial de conversación del usuario
-    history = context.user_data.get('history', [])
+    raw_history = context.user_data.get('history', [])
+    history = sanitize_history_for_model(raw_history)
     
     # Obtener recordatorios activos para contexto
     active_reminders = get_user_reminders(user_id)
@@ -1038,17 +1170,22 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
         
         if not res:
             failure = get_last_brain_failure()
-            if failure:
-                logging.error(
-                    "process_user_input falló para usuario %s: %s",
-                    user_id,
-                    json.dumps(failure, ensure_ascii=False, default=str),
-                )
-            else:
-                logging.error(f"process_user_input retornó None para usuario {user_id} sin diagnóstico estructurado")
+            logging.error(
+                "BRAIN_FAILURE | usuario=%s | texto_len=%s | history_len=%s | failure=%s",
+                user_id,
+                len(text_to_process or ""),
+                len(history),
+                json.dumps(failure, ensure_ascii=False, default=str) if failure else "None",
+            )
+            logging.error(
+                "BRAIN_FAILURE_CONTEXT | usuario=%s | texto_preview=%s | history_preview=%s",
+                user_id,
+                (text_to_process or "")[:200],
+                json.dumps(history[-4:], ensure_ascii=False, default=str)[:1000],
+            )
 
             await update.effective_message.reply_text(
-                "Lo siento, tuve un problema temporal con mi conexión cerebral. Intenta de nuevo en unos segundos."
+                build_user_brain_error_message(failure)
             )
 
             if is_transient_brain_failure(failure):
@@ -1440,6 +1577,7 @@ if __name__ == '__main__':
     from database import init_db
     init_db()
     logging.info("Base de datos inicializada correctamente")
+    validate_openrouter_key()
     
     application = ApplicationBuilder().token(telegram_token).post_init(post_init).build()
     
