@@ -4,6 +4,10 @@ import sqlite3
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, 'reminders.db')
 UNCATEGORIZED_LABEL = 'Sin categoría'
+AI_TEXT_CAPABILITY = 'text'
+AI_VISION_CAPABILITY = 'vision'
+SUPPORTED_AI_CAPABILITIES = (AI_TEXT_CAPABILITY, AI_VISION_CAPABILITY)
+SUPPORTED_AI_PROVIDERS = ('openrouter', 'nvidia')
 
 
 def get_connection():
@@ -62,6 +66,42 @@ def normalize_note_subcategory_id(subcategory_id):
     return normalized
 
 
+def normalize_ai_capability(capability):
+    """Normaliza una capacidad de IA soportada por el bot."""
+    if capability is None:
+        raise ValueError('La capacidad de IA es obligatoria.')
+
+    normalized = str(capability).strip().lower()
+    if normalized not in SUPPORTED_AI_CAPABILITIES:
+        raise ValueError('Capacidad de IA no soportada.')
+
+    return normalized
+
+
+def normalize_ai_provider(provider):
+    """Normaliza un proveedor de IA soportado por el bot."""
+    if provider is None:
+        raise ValueError('El proveedor de IA es obligatorio.')
+
+    normalized = str(provider).strip().lower()
+    if normalized not in SUPPORTED_AI_PROVIDERS:
+        raise ValueError('Proveedor de IA no soportado.')
+
+    return normalized
+
+
+def normalize_ai_model_name(model_name):
+    """Normaliza el nombre exacto de un modelo de IA."""
+    if model_name is None:
+        raise ValueError('El nombre del modelo es obligatorio.')
+
+    normalized = str(model_name).strip()
+    if not normalized:
+        raise ValueError('El nombre del modelo es obligatorio.')
+
+    return normalized
+
+
 def max_timestamp(first_value, second_value):
     """Retorna la fecha más reciente entre dos timestamps ISO o valores nulos."""
     if not first_value:
@@ -109,6 +149,61 @@ def ensure_note_subcategories_table(cursor):
         CREATE INDEX IF NOT EXISTS idx_note_subcategories_user_category
         ON note_subcategories (user_id, category_name COLLATE NOCASE)
     ''')
+
+
+def ensure_ai_config_tables(cursor):
+    """Crea las tablas e índices necesarios para la configuración global de IA."""
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ai_global_settings (
+            capability TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ai_model_catalog (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider TEXT NOT NULL,
+            capability TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_used_at DATETIME DEFAULT NULL,
+            UNIQUE(provider, capability, model_name)
+        )
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_ai_model_catalog_lookup
+        ON ai_model_catalog (capability, provider, model_name)
+    ''')
+
+
+def serialize_ai_setting_row(row):
+    if row is None:
+        return None
+
+    return {
+        'capability': row[0],
+        'provider': row[1],
+        'model_name': row[2],
+        'updated_at': row[3],
+    }
+
+
+def serialize_ai_model_row(row):
+    if row is None:
+        return None
+
+    return {
+        'id': row[0],
+        'provider': row[1],
+        'capability': row[2],
+        'model_name': row[3],
+        'created_at': row[4],
+        'updated_at': row[5],
+        'last_used_at': row[6],
+    }
 
 
 def category_exists_for_user(cursor, user_id, category_name):
@@ -196,6 +291,7 @@ def init_db():
     ensure_notes_category_column(cursor)
     ensure_notes_subcategory_column(cursor)
     ensure_note_subcategories_table(cursor)
+    ensure_ai_config_tables(cursor)
     conn.commit()
     conn.close()
 
@@ -333,6 +429,200 @@ def get_users_with_daily_summary():
     rows = cursor.fetchall()
     conn.close()
     return rows
+
+
+def ensure_default_ai_settings(default_settings):
+    """Si no existe configuración activa, siembra los defaults iniciales."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    ensure_ai_config_tables(cursor)
+
+    for capability, raw_config in (default_settings or {}).items():
+        normalized_capability = normalize_ai_capability(capability)
+        provider = normalize_ai_provider(raw_config.get('provider'))
+        model_name = normalize_ai_model_name(raw_config.get('model_name'))
+
+        cursor.execute(
+            '''
+            INSERT INTO ai_model_catalog (provider, capability, model_name)
+            VALUES (?, ?, ?)
+            ON CONFLICT(provider, capability, model_name) DO UPDATE SET
+                updated_at = CURRENT_TIMESTAMP
+            ''',
+            (provider, normalized_capability, model_name)
+        )
+        cursor.execute(
+            '''
+            INSERT INTO ai_global_settings (capability, provider, model_name)
+            VALUES (?, ?, ?)
+            ON CONFLICT(capability) DO NOTHING
+            ''',
+            (normalized_capability, provider, model_name)
+        )
+
+    conn.commit()
+    conn.close()
+    return get_all_ai_settings()
+
+
+def get_ai_setting(capability):
+    """Obtiene la configuración activa para una capacidad de IA."""
+    normalized_capability = normalize_ai_capability(capability)
+    conn = get_connection()
+    cursor = conn.cursor()
+    ensure_ai_config_tables(cursor)
+    cursor.execute(
+        '''
+        SELECT capability, provider, model_name, updated_at
+        FROM ai_global_settings
+        WHERE capability = ?
+        ''',
+        (normalized_capability,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return serialize_ai_setting_row(row)
+
+
+def get_all_ai_settings():
+    """Obtiene todas las configuraciones activas de IA indexadas por capacidad."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    ensure_ai_config_tables(cursor)
+    cursor.execute(
+        '''
+        SELECT capability, provider, model_name, updated_at
+        FROM ai_global_settings
+        ORDER BY capability ASC
+        '''
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return {
+        row[0]: serialize_ai_setting_row(row)
+        for row in rows
+    }
+
+
+def save_ai_model(provider, capability, model_name):
+    """Guarda un modelo en el catálogo reutilizable sin activarlo."""
+    normalized_provider = normalize_ai_provider(provider)
+    normalized_capability = normalize_ai_capability(capability)
+    normalized_model_name = normalize_ai_model_name(model_name)
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    ensure_ai_config_tables(cursor)
+    cursor.execute(
+        '''
+        INSERT INTO ai_model_catalog (provider, capability, model_name)
+        VALUES (?, ?, ?)
+        ON CONFLICT(provider, capability, model_name) DO UPDATE SET
+            updated_at = CURRENT_TIMESTAMP
+        ''',
+        (normalized_provider, normalized_capability, normalized_model_name)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_saved_ai_models(capability=None, provider=None, limit=None):
+    """Lista el catálogo de modelos guardados filtrando por capacidad o proveedor."""
+    params = []
+    conditions = []
+
+    if capability is not None:
+        conditions.append('capability = ?')
+        params.append(normalize_ai_capability(capability))
+
+    if provider is not None:
+        conditions.append('provider = ?')
+        params.append(normalize_ai_provider(provider))
+
+    query = '''
+        SELECT id, provider, capability, model_name, created_at, updated_at, last_used_at
+        FROM ai_model_catalog
+    '''
+
+    if conditions:
+        query += ' WHERE ' + ' AND '.join(conditions)
+
+    query += '''
+        ORDER BY capability ASC,
+                 provider ASC,
+                 COALESCE(last_used_at, updated_at, created_at) DESC,
+                 model_name COLLATE NOCASE ASC
+    '''
+
+    if limit is not None:
+        query += ' LIMIT ?'
+        params.append(int(limit))
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    ensure_ai_config_tables(cursor)
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return [serialize_ai_model_row(row) for row in rows]
+
+
+def get_ai_model_by_id(model_id):
+    """Busca un modelo guardado por su identificador interno."""
+    try:
+        normalized_model_id = int(model_id)
+    except (TypeError, ValueError):
+        return None
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    ensure_ai_config_tables(cursor)
+    cursor.execute(
+        '''
+        SELECT id, provider, capability, model_name, created_at, updated_at, last_used_at
+        FROM ai_model_catalog
+        WHERE id = ?
+        ''',
+        (normalized_model_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return serialize_ai_model_row(row)
+
+
+def activate_ai_model(capability, provider, model_name):
+    """Activa una combinación proveedor/modelo para una capacidad de IA."""
+    normalized_capability = normalize_ai_capability(capability)
+    normalized_provider = normalize_ai_provider(provider)
+    normalized_model_name = normalize_ai_model_name(model_name)
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    ensure_ai_config_tables(cursor)
+    cursor.execute(
+        '''
+        INSERT INTO ai_model_catalog (provider, capability, model_name, last_used_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(provider, capability, model_name) DO UPDATE SET
+            updated_at = CURRENT_TIMESTAMP,
+            last_used_at = CURRENT_TIMESTAMP
+        ''',
+        (normalized_provider, normalized_capability, normalized_model_name)
+    )
+    cursor.execute(
+        '''
+        INSERT INTO ai_global_settings (capability, provider, model_name, updated_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(capability) DO UPDATE SET
+            provider = excluded.provider,
+            model_name = excluded.model_name,
+            updated_at = CURRENT_TIMESTAMP
+        ''',
+        (normalized_capability, normalized_provider, normalized_model_name)
+    )
+    conn.commit()
+    conn.close()
+    return get_ai_setting(normalized_capability)
 
 def get_today_reminders(user_id):
     """Obtiene los recordatorios programados para hoy para un usuario."""

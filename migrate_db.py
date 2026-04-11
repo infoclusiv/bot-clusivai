@@ -6,13 +6,15 @@ Actualmente asegura:
 - notes.category
 - notes.subcategory_id
 - note_subcategories
+- ai_global_settings
+- ai_model_catalog
 """
 
 import sqlite3
 import os
 import sys
 
-from database import ensure_note_subcategories_table, ensure_notes_subcategory_column
+from database import ensure_ai_config_tables, ensure_note_subcategories_table, ensure_notes_subcategory_column
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, 'reminders.db')
@@ -76,6 +78,23 @@ def migrate_db():
             print("✓ La tabla note_subcategories ya existe.")
         else:
             print("Creando tabla note_subcategories...")
+            migrated_any = True
+
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ai_global_settings'")
+        ai_settings_table_exists = cursor.fetchone() is not None
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ai_model_catalog'")
+        ai_catalog_table_exists = cursor.fetchone() is not None
+        ensure_ai_config_tables(cursor)
+        if ai_settings_table_exists:
+            print("✓ La tabla ai_global_settings ya existe.")
+        else:
+            print("Creando tabla ai_global_settings...")
+            migrated_any = True
+
+        if ai_catalog_table_exists:
+            print("✓ La tabla ai_model_catalog ya existe.")
+        else:
+            print("Creando tabla ai_model_catalog...")
             migrated_any = True
         
         conn.commit()

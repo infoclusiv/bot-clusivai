@@ -10,14 +10,20 @@ import threading
 import time
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from database import AI_TEXT_CAPABILITY, AI_VISION_CAPABILITY, get_ai_setting
 
 load_dotenv()
 
-API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL = os.getenv("MODEL_NAME")
-DEFAULT_TEXT_MODEL = "stepfun/step-3.5-flash:free"
-VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+MODEL_NAME = os.getenv("MODEL_NAME")
+VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME")
+DEFAULT_TEXT_PROVIDER = os.getenv("DEFAULT_TEXT_PROVIDER", "openrouter")
+DEFAULT_VISION_PROVIDER = os.getenv("DEFAULT_VISION_PROVIDER", "openrouter")
+DEFAULT_TEXT_MODEL = MODEL_NAME or "stepfun/step-3.5-flash:free"
+DEFAULT_VISION_MODEL = VISION_MODEL_NAME or "nvidia/nemotron-nano-12b-v2-vl:free"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 TRANSIENT_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 TRANSIENT_FAILURE_KINDS = {"http_status_error", "timeout", "network_error"}
 OPENROUTER_MAX_ATTEMPTS = int(os.getenv("OPENROUTER_MAX_ATTEMPTS", "3"))
@@ -84,20 +90,83 @@ def _record_brain_failure(kind, context_label, **details):
     return failure
 
 
-def get_openrouter_api_key():
-    return os.getenv("OPENROUTER_API_KEY") or API_KEY
+def _coerce_provider_name(provider_name, fallback="openrouter"):
+    normalized = str(provider_name or fallback).strip().lower()
+    if normalized in {"openrouter", "nvidia"}:
+        return normalized
+
+    logger.warning(
+        "Proveedor de IA no soportado en configuración (%s); usando %s",
+        provider_name,
+        fallback,
+    )
+    return fallback
+
+
+def get_default_ai_settings():
+    return {
+        AI_TEXT_CAPABILITY: {
+            "capability": AI_TEXT_CAPABILITY,
+            "provider": _coerce_provider_name(DEFAULT_TEXT_PROVIDER, fallback="openrouter"),
+            "model_name": os.getenv("MODEL_NAME") or DEFAULT_TEXT_MODEL,
+            "source": "default",
+        },
+        AI_VISION_CAPABILITY: {
+            "capability": AI_VISION_CAPABILITY,
+            "provider": _coerce_provider_name(DEFAULT_VISION_PROVIDER, fallback="openrouter"),
+            "model_name": os.getenv("VISION_MODEL_NAME") or DEFAULT_VISION_MODEL,
+            "source": "default",
+        },
+    }
+
+
+def get_ai_configuration(capability):
+    normalized_capability = str(capability).strip().lower()
+    default_config = get_default_ai_settings().get(normalized_capability)
+    if default_config is None:
+        raise ValueError(f"Capacidad de IA no soportada: {capability}")
+
+    stored_config = get_ai_setting(normalized_capability)
+    if stored_config and stored_config.get("provider") and stored_config.get("model_name"):
+        return {
+            "capability": normalized_capability,
+            "provider": stored_config["provider"],
+            "model_name": stored_config["model_name"],
+            "updated_at": stored_config.get("updated_at"),
+            "source": "database",
+        }
+
+    return dict(default_config)
+
+
+def get_all_ai_configurations():
+    return {
+        AI_TEXT_CAPABILITY: get_ai_configuration(AI_TEXT_CAPABILITY),
+        AI_VISION_CAPABILITY: get_ai_configuration(AI_VISION_CAPABILITY),
+    }
+
+
+def get_provider_api_key(provider):
+    normalized_provider = _coerce_provider_name(provider)
+    if normalized_provider == "nvidia":
+        return os.getenv("NVIDIA_API_KEY") or NVIDIA_API_KEY
+    return os.getenv("OPENROUTER_API_KEY") or OPENROUTER_API_KEY
 
 
 def get_text_model():
-    configured_model = os.getenv("MODEL_NAME") or MODEL
-    if configured_model:
-        return configured_model
+    return get_ai_configuration(AI_TEXT_CAPABILITY)["model_name"]
 
-    logger.warning(
-        "MODEL_NAME no está configurado; usando modelo por defecto %s",
-        DEFAULT_TEXT_MODEL,
-    )
-    return DEFAULT_TEXT_MODEL
+
+def get_text_provider():
+    return get_ai_configuration(AI_TEXT_CAPABILITY)["provider"]
+
+
+def get_vision_model():
+    return get_ai_configuration(AI_VISION_CAPABILITY)["model_name"]
+
+
+def get_vision_provider():
+    return get_ai_configuration(AI_VISION_CAPABILITY)["provider"]
 
 
 def build_openrouter_headers(api_key):
@@ -208,14 +277,82 @@ def parse_structured_response(content, *, context_label):
     return None
 
 
-def post_openrouter_chat(data, *, timeout, log_context, max_attempts=None):
-    api_key = get_openrouter_api_key()
+def extract_message_content_text(content):
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+
+            if isinstance(item, dict):
+                if isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+                elif isinstance(item.get("content"), str):
+                    parts.append(item["content"])
+
+        return "".join(parts).strip()
+
+    if content is None:
+        return ""
+
+    return str(content).strip()
+
+
+def extract_response_text(response_data, *, log_context, ai_config):
+    if 'choices' not in response_data or not response_data['choices']:
+        logger.error("Respuesta inválida de API (%s): %s", log_context, response_data)
+        _record_brain_failure(
+            "invalid_provider_payload",
+            log_context,
+            provider=ai_config.get("provider"),
+            capability=ai_config.get("capability"),
+            model=ai_config.get("model_name"),
+            response_excerpt=_serialize_preview(response_data),
+            transient=False,
+        )
+        return None
+
+    choice = response_data['choices'][0] or {}
+    message = choice.get('message') or {}
+    content = extract_message_content_text(message.get('content'))
+    if content:
+        return content
+
+    delta = choice.get('delta') or {}
+    content = extract_message_content_text(delta.get('content'))
+    if content:
+        return content
+
+    logger.error("Respuesta vacía del proveedor (%s)", log_context)
+    _record_brain_failure(
+        "empty_model_response",
+        log_context,
+        provider=ai_config.get("provider"),
+        capability=ai_config.get("capability"),
+        model=ai_config.get("model_name"),
+        response_excerpt=_serialize_preview(response_data),
+        transient=False,
+    )
+    return None
+
+
+def post_openrouter_chat(data, *, timeout, log_context, ai_config=None, max_attempts=None):
+    ai_config = ai_config or get_ai_configuration(AI_TEXT_CAPABILITY)
+    provider = "openrouter"
+    model_name = data.get("model") or ai_config.get("model_name")
+    api_key = get_provider_api_key(provider)
     if not api_key:
         logger.error("ERROR: OPENROUTER_API_KEY no está configurado")
         _record_brain_failure(
             "missing_api_key",
             log_context,
-            model=data.get("model"),
+            provider=provider,
+            capability=ai_config.get("capability"),
+            model=model_name,
             transient=False,
         )
         return None
@@ -227,11 +364,13 @@ def post_openrouter_chat(data, *, timeout, log_context, max_attempts=None):
         started_at = time.monotonic()
         try:
             logger.info(
-                "Enviando request a OpenRouter (%s), intento %s/%s, modelo=%s",
+                "Enviando request a %s (%s), intento %s/%s, capacidad=%s, modelo=%s",
+                provider,
                 log_context,
                 attempt,
                 max_attempts,
-                data.get('model'),
+                ai_config.get('capability'),
+                model_name,
             )
             response = requests.post(
                 OPENROUTER_URL,
@@ -242,11 +381,13 @@ def post_openrouter_chat(data, *, timeout, log_context, max_attempts=None):
             elapsed_ms = int((time.monotonic() - started_at) * 1000)
 
             logger.info(
-                "Respuesta de OpenRouter (%s), intento %s/%s, modelo=%s, status=%s, duracion_ms=%s",
+                "Respuesta de %s (%s), intento %s/%s, capacidad=%s, modelo=%s, status=%s, duracion_ms=%s",
+                provider,
                 log_context,
                 attempt,
                 max_attempts,
-                data.get('model'),
+                ai_config.get('capability'),
+                model_name,
                 response.status_code,
                 elapsed_ms,
             )
@@ -256,7 +397,8 @@ def post_openrouter_chat(data, *, timeout, log_context, max_attempts=None):
                 if response.status_code in TRANSIENT_STATUS_CODES and attempt < max_attempts:
                     sleep_seconds = _build_retry_delay(attempt)
                     logger.warning(
-                        "OpenRouter devolvió status %s (%s), reintentando en %.2fs. Respuesta: %s",
+                        "%s devolvió status %s (%s), reintentando en %.2fs. Respuesta: %s",
+                        provider,
                         response.status_code,
                         log_context,
                         sleep_seconds,
@@ -266,7 +408,8 @@ def post_openrouter_chat(data, *, timeout, log_context, max_attempts=None):
                     continue
 
                 logger.error(
-                    "Error en API OpenRouter (%s): Status %s, Response: %s",
+                    "Error en API %s (%s): Status %s, Response: %s",
+                    provider,
                     log_context,
                     response.status_code,
                     body_preview,
@@ -274,7 +417,9 @@ def post_openrouter_chat(data, *, timeout, log_context, max_attempts=None):
                 _record_brain_failure(
                     "http_status_error",
                     log_context,
-                    model=data.get("model"),
+                    provider=provider,
+                    capability=ai_config.get("capability"),
+                    model=model_name,
                     status_code=response.status_code,
                     attempt=attempt,
                     max_attempts=max_attempts,
@@ -289,14 +434,17 @@ def post_openrouter_chat(data, *, timeout, log_context, max_attempts=None):
                 return response.json()
             except ValueError:
                 logger.error(
-                    "OpenRouter devolvió una respuesta no JSON (%s): %s",
+                    "%s devolvió una respuesta no JSON (%s): %s",
+                    provider,
                     log_context,
                     response.text[:500],
                 )
                 _record_brain_failure(
-                    "invalid_openrouter_payload",
+                    "invalid_provider_payload",
                     log_context,
-                    model=data.get("model"),
+                    provider=provider,
+                    capability=ai_config.get("capability"),
+                    model=model_name,
                     status_code=response.status_code,
                     attempt=attempt,
                     max_attempts=max_attempts,
@@ -311,7 +459,8 @@ def post_openrouter_chat(data, *, timeout, log_context, max_attempts=None):
             if attempt < max_attempts:
                 sleep_seconds = _build_retry_delay(attempt)
                 logger.warning(
-                    "Timeout al conectar con OpenRouter (%ss) (%s), reintentando en %.2fs",
+                    "Timeout al conectar con %s (%ss) (%s), reintentando en %.2fs",
+                    provider,
                     timeout,
                     log_context,
                     sleep_seconds,
@@ -319,11 +468,13 @@ def post_openrouter_chat(data, *, timeout, log_context, max_attempts=None):
                 time.sleep(sleep_seconds)
                 continue
 
-            logger.error("Timeout al conectar con OpenRouter (%ss) (%s)", timeout, log_context)
+            logger.error("Timeout al conectar con %s (%ss) (%s)", provider, timeout, log_context)
             _record_brain_failure(
                 "timeout",
                 log_context,
-                model=data.get("model"),
+                provider=provider,
+                capability=ai_config.get("capability"),
+                model=model_name,
                 attempt=attempt,
                 max_attempts=max_attempts,
                 timeout_seconds=timeout,
@@ -334,7 +485,8 @@ def post_openrouter_chat(data, *, timeout, log_context, max_attempts=None):
             if attempt < max_attempts:
                 sleep_seconds = _build_retry_delay(attempt)
                 logger.warning(
-                    "Error de conexión con OpenRouter (%s), reintentando en %.2fs: %s",
+                    "Error de conexión con %s (%s), reintentando en %.2fs: %s",
+                    provider,
                     log_context,
                     sleep_seconds,
                     exc,
@@ -342,11 +494,13 @@ def post_openrouter_chat(data, *, timeout, log_context, max_attempts=None):
                 time.sleep(sleep_seconds)
                 continue
 
-            logger.error("Error de conexión con OpenRouter (%s): %s", log_context, exc)
+            logger.error("Error de conexión con %s (%s): %s", provider, log_context, exc)
             _record_brain_failure(
                 "network_error",
                 log_context,
-                model=data.get("model"),
+                provider=provider,
+                capability=ai_config.get("capability"),
+                model=model_name,
                 attempt=attempt,
                 max_attempts=max_attempts,
                 timeout_seconds=timeout,
@@ -357,7 +511,8 @@ def post_openrouter_chat(data, *, timeout, log_context, max_attempts=None):
             return None
         except Exception as exc:
             logger.error(
-                "Error inesperado al invocar OpenRouter (%s): %s",
+                "Error inesperado al invocar %s (%s): %s",
+                provider,
                 log_context,
                 exc,
                 exc_info=True,
@@ -365,7 +520,9 @@ def post_openrouter_chat(data, *, timeout, log_context, max_attempts=None):
             _record_brain_failure(
                 "unexpected_exception",
                 log_context,
-                model=data.get("model"),
+                provider=provider,
+                capability=ai_config.get("capability"),
+                model=model_name,
                 attempt=attempt,
                 max_attempts=max_attempts,
                 timeout_seconds=timeout,
@@ -374,6 +531,217 @@ def post_openrouter_chat(data, *, timeout, log_context, max_attempts=None):
                 transient=False,
             )
             return None
+
+
+def post_nvidia_chat(data, *, timeout, log_context, ai_config=None, max_attempts=None):
+    ai_config = ai_config or get_ai_configuration(AI_TEXT_CAPABILITY)
+    provider = "nvidia"
+    model_name = data.get("model") or ai_config.get("model_name")
+    api_key = get_provider_api_key(provider)
+    if not api_key:
+        logger.error("ERROR: NVIDIA_API_KEY no está configurado")
+        _record_brain_failure(
+            "missing_api_key",
+            log_context,
+            provider=provider,
+            capability=ai_config.get("capability"),
+            model=model_name,
+            transient=False,
+        )
+        return None
+
+    try:
+        from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
+    except ImportError as exc:
+        logger.error("La dependencia openai no está instalada para el proveedor Nvidia")
+        _record_brain_failure(
+            "missing_dependency",
+            log_context,
+            provider=provider,
+            capability=ai_config.get("capability"),
+            model=model_name,
+            dependency="openai",
+            exception_message=str(exc),
+            transient=False,
+        )
+        return None
+
+    max_attempts = max_attempts or OPENROUTER_MAX_ATTEMPTS
+
+    for attempt in range(1, max_attempts + 1):
+        started_at = time.monotonic()
+        try:
+            logger.info(
+                "Enviando request a %s (%s), intento %s/%s, capacidad=%s, modelo=%s",
+                provider,
+                log_context,
+                attempt,
+                max_attempts,
+                ai_config.get('capability'),
+                model_name,
+            )
+            client = OpenAI(
+                base_url=NVIDIA_BASE_URL,
+                api_key=api_key,
+                timeout=timeout,
+            )
+            response = client.chat.completions.create(**data)
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+
+            logger.info(
+                "Respuesta de %s (%s), intento %s/%s, capacidad=%s, modelo=%s, duracion_ms=%s",
+                provider,
+                log_context,
+                attempt,
+                max_attempts,
+                ai_config.get('capability'),
+                model_name,
+                elapsed_ms,
+            )
+
+            if hasattr(response, 'model_dump'):
+                return response.model_dump(exclude_none=True)
+            if isinstance(response, dict):
+                return response
+
+            return json.loads(response.json())
+
+        except APITimeoutError:
+            if attempt < max_attempts:
+                sleep_seconds = _build_retry_delay(attempt)
+                logger.warning(
+                    "Timeout al conectar con %s (%ss) (%s), reintentando en %.2fs",
+                    provider,
+                    timeout,
+                    log_context,
+                    sleep_seconds,
+                )
+                time.sleep(sleep_seconds)
+                continue
+
+            logger.error("Timeout al conectar con %s (%ss) (%s)", provider, timeout, log_context)
+            _record_brain_failure(
+                "timeout",
+                log_context,
+                provider=provider,
+                capability=ai_config.get("capability"),
+                model=model_name,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                timeout_seconds=timeout,
+                transient=True,
+            )
+            return None
+        except APIConnectionError as exc:
+            if attempt < max_attempts:
+                sleep_seconds = _build_retry_delay(attempt)
+                logger.warning(
+                    "Error de conexión con %s (%s), reintentando en %.2fs: %s",
+                    provider,
+                    log_context,
+                    sleep_seconds,
+                    exc,
+                )
+                time.sleep(sleep_seconds)
+                continue
+
+            logger.error("Error de conexión con %s (%s): %s", provider, log_context, exc)
+            _record_brain_failure(
+                "network_error",
+                log_context,
+                provider=provider,
+                capability=ai_config.get("capability"),
+                model=model_name,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                timeout_seconds=timeout,
+                exception_type=type(exc).__name__,
+                exception_message=str(exc),
+                transient=True,
+            )
+            return None
+        except APIStatusError as exc:
+            status_code = getattr(exc, 'status_code', None)
+            body_preview = str(exc)[:500]
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+
+            if status_code in TRANSIENT_STATUS_CODES and attempt < max_attempts:
+                sleep_seconds = _build_retry_delay(attempt)
+                logger.warning(
+                    "%s devolvió status %s (%s), reintentando en %.2fs. Respuesta: %s",
+                    provider,
+                    status_code,
+                    log_context,
+                    sleep_seconds,
+                    body_preview,
+                )
+                time.sleep(sleep_seconds)
+                continue
+
+            logger.error(
+                "Error en API %s (%s): Status %s, Response: %s",
+                provider,
+                log_context,
+                status_code,
+                body_preview,
+            )
+            _record_brain_failure(
+                "http_status_error",
+                log_context,
+                provider=provider,
+                capability=ai_config.get("capability"),
+                model=model_name,
+                status_code=status_code,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                timeout_seconds=timeout,
+                duration_ms=elapsed_ms,
+                response_excerpt=body_preview,
+                transient=status_code in TRANSIENT_STATUS_CODES,
+            )
+            return None
+        except Exception as exc:
+            logger.error(
+                "Error inesperado al invocar %s (%s): %s",
+                provider,
+                log_context,
+                exc,
+                exc_info=True,
+            )
+            _record_brain_failure(
+                "unexpected_exception",
+                log_context,
+                provider=provider,
+                capability=ai_config.get("capability"),
+                model=model_name,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                timeout_seconds=timeout,
+                exception_type=type(exc).__name__,
+                exception_message=str(exc),
+                transient=False,
+            )
+            return None
+
+
+def post_ai_chat(data, *, timeout, log_context, ai_config, max_attempts=None):
+    provider = _coerce_provider_name(ai_config.get("provider"))
+    if provider == "nvidia":
+        return post_nvidia_chat(
+            data,
+            timeout=timeout,
+            log_context=log_context,
+            ai_config=ai_config,
+            max_attempts=max_attempts,
+        )
+
+    return post_openrouter_chat(
+        data,
+        timeout=timeout,
+        log_context=log_context,
+        ai_config=ai_config,
+        max_attempts=max_attempts,
+    )
 
 def extract_json_from_text(text):
     """
@@ -400,54 +768,45 @@ def extract_json_from_text(text):
         return None
 
 
-def request_openrouter_text(messages, timeout=OPENROUTER_TEXT_TIMEOUT, max_tokens=None):
-    """Hace una llamada simple a OpenRouter y retorna texto plano."""
+def request_ai_text(messages, timeout=OPENROUTER_TEXT_TIMEOUT, max_tokens=None, log_context=None, capability=AI_TEXT_CAPABILITY):
+    """Hace una llamada de texto al proveedor activo y retorna texto plano."""
     clear_last_brain_failure()
-    api_key = get_openrouter_api_key()
-    if not api_key:
-        logger.error("ERROR: OPENROUTER_API_KEY no está configurado")
-        _record_brain_failure("missing_api_key", "texto", transient=False)
-        return None
-
+    ai_config = get_ai_configuration(capability)
     data = {
-        "model": get_text_model(),
+        "model": ai_config["model_name"],
         "messages": messages,
     }
     if max_tokens is not None:
         data["max_tokens"] = max_tokens
 
-    response_data = post_openrouter_chat(
+    resolved_log_context = log_context or f"texto/{len(messages)}_mensajes"
+    response_data = post_ai_chat(
         data,
         timeout=timeout,
-        log_context=f"texto/{len(messages)}_mensajes",
+        log_context=resolved_log_context,
+        ai_config=ai_config,
     )
     if not response_data:
         return None
 
-    if 'choices' not in response_data or not response_data['choices']:
-        logger.error(f"Respuesta de API inválida: {response_data}")
-        _record_brain_failure(
-            "invalid_openrouter_payload",
-            f"texto/{len(messages)}_mensajes",
-            model=data.get("model"),
-            response_excerpt=_serialize_preview(response_data),
-            transient=False,
-        )
+    content = extract_response_text(
+        response_data,
+        log_context=resolved_log_context,
+        ai_config=ai_config,
+    )
+    if content is None:
         return None
 
-    content = response_data['choices'][0]['message']['content'].strip()
-    logger.info(f"Respuesta de OpenRouter generada: {len(content)} caracteres")
+    logger.info(
+        "Respuesta de %s generada: %s caracteres",
+        ai_config["provider"],
+        len(content),
+    )
     return content
 
 def process_user_input(text, history=None, active_reminders=None):
     clear_last_brain_failure()
-    api_key = get_openrouter_api_key()
-    if not api_key:
-        logger.error("ERROR: OPENROUTER_API_KEY no está configurado")
-        _record_brain_failure("missing_api_key", "recordatorios", transient=False)
-        return None
-    model = get_text_model()
-    
+
     # Obtener hora actual de Bogotá
     tz_bogota = pytz.timezone('America/Bogota')
     now = datetime.now(tz_bogota)
@@ -569,31 +928,14 @@ def process_user_input(text, history=None, active_reminders=None):
     # Agregar mensaje actual del usuario
     messages.append({"role": "user", "content": text})
     
-    data = {
-        "model": model,
-        "messages": messages
-    }
-
-    response_data = post_openrouter_chat(
-        data,
+    content = request_ai_text(
+        messages,
         timeout=OPENROUTER_TEXT_TIMEOUT,
         log_context=f"recordatorios/{len(messages)}_mensajes",
     )
-    if not response_data:
+    if content is None:
         return None
 
-    if 'choices' not in response_data or not response_data['choices']:
-        logger.error(f"Respuesta de API inválida: {response_data}")
-        _record_brain_failure(
-            "invalid_openrouter_payload",
-            f"recordatorios/{len(messages)}_mensajes",
-            model=model,
-            response_excerpt=_serialize_preview(response_data),
-            transient=False,
-        )
-        return None
-
-    content = response_data['choices'][0]['message']['content']
     logger.info(f"Respuesta cruda de IA: {str(content)[:200]}...")
 
     parsed_result = parse_structured_response(content, context_label="recordatorios")
@@ -616,15 +958,6 @@ def process_vision_input(text, image_base64, history=None, active_reminders=None
         Dict con la respuesta parseada o None si hay error
     """
     clear_last_brain_failure()
-    api_key = get_openrouter_api_key()
-    if not api_key:
-        logger.error("ERROR: OPENROUTER_API_KEY no está configurado")
-        _record_brain_failure("missing_api_key", "vision", transient=False)
-        return None
-    if not VISION_MODEL:
-        logger.error("ERROR: VISION_MODEL no está configurado")
-        _record_brain_failure("missing_vision_model", "vision", transient=False)
-        return None
     
     # Obtener hora actual de Bogotá
     tz_bogota = pytz.timezone('America/Bogota')
@@ -710,31 +1043,15 @@ def process_vision_input(text, image_base64, history=None, active_reminders=None
     # Agregar mensaje actual con imagen
     messages.append({"role": "user", "content": user_content})
     
-    data = {
-        "model": VISION_MODEL,
-        "messages": messages
-    }
-
-    response_data = post_openrouter_chat(
-        data,
+    content = request_ai_text(
+        messages,
         timeout=OPENROUTER_VISION_TIMEOUT,
         log_context="vision",
+        capability=AI_VISION_CAPABILITY,
     )
-    if not response_data:
+    if content is None:
         return None
 
-    if 'choices' not in response_data or not response_data['choices']:
-        logger.error(f"Respuesta de API inválida (visión): {response_data}")
-        _record_brain_failure(
-            "invalid_openrouter_payload",
-            "vision",
-            model=VISION_MODEL,
-            response_excerpt=_serialize_preview(response_data),
-            transient=False,
-        )
-        return None
-
-    content = response_data['choices'][0]['message']['content']
     logger.info(f"Respuesta cruda de IA (visión): {str(content)[:200]}...")
 
     parsed_result = parse_structured_response(content, context_label="vision")
@@ -756,13 +1073,7 @@ def process_notes_query(user_query, notes_data, history=None):
         String con la respuesta natural, o None si hay error
     """
     clear_last_brain_failure()
-    api_key = get_openrouter_api_key()
-    if not api_key:
-        logger.error("API_KEY no configurada para process_notes_query")
-        _record_brain_failure("missing_api_key", "notas", transient=False)
-        return None
-    model = get_text_model()
-    
+
     # Formatear notas como contexto
     if notes_data:
         notes_context = "NOTAS GUARDADAS POR EL USUARIO:\n"
@@ -801,33 +1112,20 @@ Reglas:
     
     messages.append({"role": "user", "content": user_query})
     
-    data = {"model": model, "messages": messages}
-
-    response_data = post_openrouter_chat(
-        data,
+    content = request_ai_text(
+        messages,
         timeout=OPENROUTER_TEXT_TIMEOUT,
         log_context="notas",
     )
-    if not response_data:
+    if content is None:
         return None
 
-    if 'choices' not in response_data or not response_data['choices']:
-        logger.error(f"Respuesta inválida de API (notas): {response_data}")
-        _record_brain_failure(
-            "invalid_openrouter_payload",
-            "notas",
-            model=model,
-            response_excerpt=_serialize_preview(response_data),
-            transient=False,
-        )
-        return None
-
-    content = response_data['choices'][0]['message']['content'].strip()
+    content = content.strip()
     logger.info(f"Respuesta de notas: {content[:100]}...")
     return content
 
 def process_video_summary(transcript, user_instruction=None, history=None, video_source="X.com"):
-    """Analiza y resume la transcripción de un video usando el LLM de OpenRouter.
+    """Analiza y resume la transcripción de un video usando el proveedor activo.
     
     Args:
         transcript: Texto transcrito del video.
@@ -839,13 +1137,7 @@ def process_video_summary(transcript, user_instruction=None, history=None, video
         String con el resumen/análisis, o None si hay error.
     """
     clear_last_brain_failure()
-    api_key = get_openrouter_api_key()
-    if not api_key:
-        logger.error("API_KEY no configurada para process_video_summary")
-        _record_brain_failure("missing_api_key", "video_summary", transient=False)
-        return None
-    model = get_text_model()
-    
+
     # Truncar transcript si es muy largo para no exceder límites del modelo
     max_transcript_chars = 15000  # ~3750 tokens aprox
     truncated = False
@@ -902,28 +1194,15 @@ Reglas:
     
     messages.append({"role": "user", "content": user_content})
     
-    data = {"model": model, "messages": messages}
-
-    response_data = post_openrouter_chat(
-        data,
+    content = request_ai_text(
+        messages,
         timeout=OPENROUTER_VIDEO_TIMEOUT,
         log_context="video_summary",
     )
-    if not response_data:
+    if content is None:
         return None
 
-    if 'choices' not in response_data or not response_data['choices']:
-        logger.error(f"Respuesta inválida de API (video summary): {response_data}")
-        _record_brain_failure(
-            "invalid_openrouter_payload",
-            "video_summary",
-            model=model,
-            response_excerpt=_serialize_preview(response_data),
-            transient=False,
-        )
-        return None
-
-    content = response_data['choices'][0]['message']['content'].strip()
+    content = content.strip()
     logger.info(f"Resumen de video generado: {len(content)} caracteres")
     return content
 
@@ -965,7 +1244,12 @@ Reglas:
     )
     messages.append({"role": "user", "content": user_content})
 
-    return request_openrouter_text(messages, timeout=OPENROUTER_REPO_TIMEOUT, max_tokens=REPO_PARTIAL_MAX_TOKENS)
+    return request_ai_text(
+        messages,
+        timeout=OPENROUTER_REPO_TIMEOUT,
+        max_tokens=REPO_PARTIAL_MAX_TOKENS,
+        log_context=f"repo_chunk/{chunk_index}_{total_chunks}",
+    )
 
 
 def synthesize_repository_analysis(repo_slug, repo_summary, repo_tree, partial_analyses, history=None):
@@ -1009,4 +1293,9 @@ Reglas:
     )
     messages.append({"role": "user", "content": user_content})
 
-    return request_openrouter_text(messages, timeout=OPENROUTER_REPO_TIMEOUT, max_tokens=REPO_SYNTHESIS_MAX_TOKENS)
+    return request_ai_text(
+        messages,
+        timeout=OPENROUTER_REPO_TIMEOUT,
+        max_tokens=REPO_SYNTHESIS_MAX_TOKENS,
+        log_context="repo_synthesis",
+    )

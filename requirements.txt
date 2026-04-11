@@ -1,6 +1,7 @@
 Flask
 Flask-Cors
 gitingest
+openai
 python-dateutil
 python-dotenv
 python-telegram-bot[job-queue]

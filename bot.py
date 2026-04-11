@@ -10,7 +10,6 @@ import pytz
 import logging
 import json
 import base64
-import requests
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from dateutil import rrule
@@ -19,17 +18,24 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppI
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler, CallbackQueryHandler
 
 from brain import (
+    get_all_ai_configurations,
+    get_default_ai_settings,
     get_last_brain_failure,
     is_transient_brain_failure,
     process_notes_query,
     process_user_input,
     process_video_summary,
     process_vision_input,
+    request_ai_text,
 )
-from database import (add_reminder, get_user_reminders, get_connection, 
-                      delete_reminder_by_text, update_reminder_by_id, 
-                      set_daily_summary, get_users_with_daily_summary, get_today_reminders,
-                      create_note, get_notes_by_user, normalize_note_category, UNCATEGORIZED_LABEL)
+from database import (AI_TEXT_CAPABILITY, AI_VISION_CAPABILITY, UNCATEGORIZED_LABEL,
+                      activate_ai_model, add_reminder, create_note,
+                      delete_reminder_by_text, ensure_default_ai_settings,
+                      get_ai_model_by_id, get_connection, get_notes_by_user,
+                      get_saved_ai_models, get_today_reminders,
+                      get_user_reminders, get_users_with_daily_summary,
+                      normalize_note_category, save_ai_model,
+                      set_daily_summary, update_reminder_by_id)
 from repo_analysis_worker import run_repository_analysis_worker
 from video_handler import extract_x_url, download_audio, transcribe_audio, cleanup_audio
 from repo_handler import extract_github_repo_url
@@ -44,11 +50,20 @@ from youtube_handler import (
 load_dotenv()
 
 WEBAPP_URL = os.getenv("PUBLIC_WEBAPP_URL") or os.getenv("WEBAPP_URL")
-VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"
-DEFAULT_MODEL = os.getenv("MODEL_NAME")
 LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", "logs/clusivai-bot.log")
 LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", "1048576"))
 LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "5"))
+AI_PENDING_MODEL_KEY = 'ai_pending_model_entry'
+AI_CALLBACK_PREFIX = 'ai:'
+AI_PROVIDER_LABELS = {
+    'openrouter': 'OpenRouter',
+    'nvidia': 'Nvidia',
+}
+AI_CAPABILITY_LABELS = {
+    AI_TEXT_CAPABILITY: 'Texto',
+    AI_VISION_CAPABILITY: 'Vision',
+}
+DEFAULT_NVIDIA_TEXT_MODEL = os.getenv('NVIDIA_TEXT_MODEL_NAME', 'stepfun-ai/step-3.5-flash')
 
 
 def configure_logging():
@@ -394,66 +409,365 @@ def build_user_brain_error_message(failure):
         return "El servicio de IA esta temporalmente saturado. Espera unos segundos e intenta de nuevo."
     if failure_status == 503:
         return "El servicio de IA no esta disponible temporalmente. Intenta de nuevo en unos segundos."
-    if failure_kind in ("invalid_json_response", "invalid_openrouter_payload"):
+    if failure_kind == "missing_dependency":
+        return "Falta una dependencia interna del servicio de IA. Contacta al administrador."
+    if failure_kind in ("invalid_json_response", "invalid_openrouter_payload", "invalid_provider_payload"):
         return "No pude interpretar la respuesta del servicio de IA. Intenta reformular tu mensaje."
     return "Lo siento, tuve un problema temporal con mi conexion cerebral. Intenta de nuevo en unos segundos."
 
 
-def validate_openrouter_key():
-    """Verifica la conectividad basica con OpenRouter al iniciar el bot."""
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key or api_key == "your-openrouter-api-key":
-        logging.error("OPENROUTER_API_KEY no esta configurada o tiene el valor por defecto")
+def get_ai_capability_label(capability):
+    return AI_CAPABILITY_LABELS.get(capability, capability.title())
+
+
+def get_ai_provider_label(provider):
+    return AI_PROVIDER_LABELS.get(provider, provider.title())
+
+
+def truncate_ai_model_name(model_name, limit=42):
+    if len(model_name) <= limit:
+        return model_name
+    return f"{model_name[:limit - 1]}…"
+
+
+def clear_pending_ai_model_entry(context):
+    context.user_data.pop(AI_PENDING_MODEL_KEY, None)
+
+
+def seed_ai_catalog_defaults():
+    ensure_default_ai_settings(get_default_ai_settings())
+    save_ai_model('nvidia', AI_TEXT_CAPABILITY, DEFAULT_NVIDIA_TEXT_MODEL)
+
+
+def build_ai_status_text(notice=None):
+    configs = get_all_ai_configurations()
+    text_config = configs[AI_TEXT_CAPABILITY]
+    vision_config = configs[AI_VISION_CAPABILITY]
+
+    lines = [
+        "⚙️ Configuración global de IA",
+        "",
+        f"Texto: {get_ai_provider_label(text_config['provider'])} · {text_config['model_name']}",
+        f"Visión: {get_ai_provider_label(vision_config['provider'])} · {vision_config['model_name']}",
+    ]
+
+    if notice:
+        lines.extend(["", notice])
+
+    return "\n".join(lines)
+
+
+def build_ai_main_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Configurar texto", callback_data=f"{AI_CALLBACK_PREFIX}scope:{AI_TEXT_CAPABILITY}")],
+        [InlineKeyboardButton("🖼️ Configurar visión", callback_data=f"{AI_CALLBACK_PREFIX}scope:{AI_VISION_CAPABILITY}")],
+        [InlineKeyboardButton("🔄 Actualizar", callback_data=f"{AI_CALLBACK_PREFIX}menu")],
+    ])
+
+
+def build_ai_capability_text(capability, notice=None):
+    configs = get_all_ai_configurations()
+    config = configs[capability]
+    lines = [
+        f"⚙️ Configuración de {get_ai_capability_label(capability)}",
+        "",
+        f"Proveedor activo: {get_ai_provider_label(config['provider'])}",
+        f"Modelo activo: {config['model_name']}",
+        "",
+        "Elige el proveedor para ver y activar modelos guardados.",
+    ]
+
+    if notice:
+        lines.extend(["", notice])
+
+    return "\n".join(lines)
+
+
+def build_ai_capability_markup(capability):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("OpenRouter", callback_data=f"{AI_CALLBACK_PREFIX}provider:{capability}:openrouter"),
+            InlineKeyboardButton("Nvidia", callback_data=f"{AI_CALLBACK_PREFIX}provider:{capability}:nvidia"),
+        ],
+        [InlineKeyboardButton("🏠 Menú", callback_data=f"{AI_CALLBACK_PREFIX}menu")],
+    ])
+
+
+def build_ai_model_picker_text(capability, provider, notice=None):
+    configs = get_all_ai_configurations()
+    current_config = configs[capability]
+    saved_models = get_saved_ai_models(capability=capability, provider=provider, limit=20)
+
+    lines = [
+        f"{get_ai_capability_label(capability)} · {get_ai_provider_label(provider)}",
+        "",
+        f"Activo ahora: {get_ai_provider_label(current_config['provider'])} · {current_config['model_name']}",
+    ]
+
+    if saved_models:
+        lines.append(f"Modelos guardados: {len(saved_models)}")
+    else:
+        lines.append("Todavía no hay modelos guardados para este proveedor.")
+
+    lines.append("Pulsa un modelo para activarlo o agrega uno manualmente.")
+
+    if notice:
+        lines.extend(["", notice])
+
+    return "\n".join(lines)
+
+
+def build_ai_model_picker_markup(capability, provider):
+    configs = get_all_ai_configurations()
+    current_config = configs[capability]
+    saved_models = get_saved_ai_models(capability=capability, provider=provider, limit=20)
+    rows = []
+
+    for model in saved_models:
+        is_active = (
+            current_config['provider'] == provider
+            and current_config['model_name'] == model['model_name']
+        )
+        prefix = "✅ " if is_active else ""
+        rows.append([
+            InlineKeyboardButton(
+                f"{prefix}{truncate_ai_model_name(model['model_name'])}",
+                callback_data=f"{AI_CALLBACK_PREFIX}activate:{capability}:{model['id']}",
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            "➕ Agregar modelo",
+            callback_data=f"{AI_CALLBACK_PREFIX}add:{capability}:{provider}",
+        )
+    ])
+    rows.append([
+        InlineKeyboardButton("⬅️ Proveedores", callback_data=f"{AI_CALLBACK_PREFIX}scope:{capability}"),
+        InlineKeyboardButton("🏠 Menú", callback_data=f"{AI_CALLBACK_PREFIX}menu"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_ai_screen(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
+    if update.callback_query:
+        await query_safe_edit_message(update, context, text, reply_markup=reply_markup)
+        return
+
+    await update.effective_message.reply_text(text, reply_markup=reply_markup)
+
+
+async def show_ai_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, notice=None):
+    await send_ai_screen(
+        update,
+        context,
+        build_ai_status_text(notice=notice),
+        reply_markup=build_ai_main_markup(),
+    )
+
+
+async def show_ai_capability_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, capability: str, notice=None):
+    await send_ai_screen(
+        update,
+        context,
+        build_ai_capability_text(capability, notice=notice),
+        reply_markup=build_ai_capability_markup(capability),
+    )
+
+
+async def show_ai_model_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, capability: str, provider: str, notice=None):
+    await send_ai_screen(
+        update,
+        context,
+        build_ai_model_picker_text(capability, provider, notice=notice),
+        reply_markup=build_ai_model_picker_markup(capability, provider),
+    )
+
+
+def build_ai_pending_input_markup(capability, provider):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Volver", callback_data=f"{AI_CALLBACK_PREFIX}provider:{capability}:{provider}")],
+        [InlineKeyboardButton("🏠 Menú", callback_data=f"{AI_CALLBACK_PREFIX}menu")],
+    ])
+
+
+async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    seed_ai_catalog_defaults()
+
+    clear_pending_ai_model_entry(context)
+    await show_ai_main_menu(update, context)
+
+
+async def handle_pending_ai_model_entry(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str, user_id: int):
+    pending = context.user_data.get(AI_PENDING_MODEL_KEY)
+    if not pending:
         return False
 
-    model = DEFAULT_MODEL or "stepfun/step-3.5-flash:free"
-    logging.info("Verificando conexion con OpenRouter. Modelo=%s", model)
+    model_name = (user_text or '').strip()
+    capability = pending['capability']
+    provider = pending['provider']
+
+    if not model_name:
+        await update.effective_message.reply_text(
+            "Escríbeme el nombre exacto del modelo o envía 'cancelar'."
+        )
+        return True
+
+    if model_name.lower() in {'cancelar', '/cancelar'}:
+        clear_pending_ai_model_entry(context)
+        await show_ai_model_picker(update, context, capability, provider, notice="Operación cancelada.")
+        return True
 
     try:
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": "di solo: ok"}],
-                "max_tokens": 5,
-            },
-            timeout=15,
-        )
-    except requests.exceptions.RequestException as exc:
-        logging.warning("No se pudo verificar OpenRouter al iniciar: %s", exc)
+        save_ai_model(provider, capability, model_name)
+        activate_ai_model(capability, provider, model_name)
+    except ValueError as exc:
+        await update.effective_message.reply_text(f"❌ {exc}")
         return True
 
-    if response.status_code == 200:
-        logging.info("Conexion con OpenRouter verificada correctamente")
+    clear_pending_ai_model_entry(context)
+    await show_ai_model_picker(
+        update,
+        context,
+        capability,
+        provider,
+        notice=(
+            f"✅ {get_ai_capability_label(capability)} ahora usa "
+            f"{get_ai_provider_label(provider)} · {model_name}"
+        ),
+    )
+    return True
+
+
+async def ai_settings_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    parts = (query.data or '').split(':')
+    if len(parts) < 2:
+        await query.answer("Acción no válida.", show_alert=True)
+        return
+
+    action = parts[1]
+    if action != 'add':
+        clear_pending_ai_model_entry(context)
+
+    if action == 'menu':
+        await show_ai_main_menu(update, context)
+        return
+
+    if action == 'scope' and len(parts) == 3:
+        await show_ai_capability_menu(update, context, parts[2])
+        return
+
+    if action == 'provider' and len(parts) == 4:
+        await show_ai_model_picker(update, context, parts[2], parts[3])
+        return
+
+    if action == 'activate' and len(parts) == 4:
+        capability = parts[2]
+        model = get_ai_model_by_id(parts[3])
+        if not model:
+            await query.answer("Ese modelo ya no existe.", show_alert=True)
+            await show_ai_capability_menu(update, context, capability, notice="El modelo seleccionado ya no está disponible.")
+            return
+
+        if model['capability'] != capability:
+            await query.answer("El modelo no corresponde a esa capacidad.", show_alert=True)
+            return
+
+        activate_ai_model(capability, model['provider'], model['model_name'])
+        await show_ai_model_picker(
+            update,
+            context,
+            capability,
+            model['provider'],
+            notice=(
+                f"✅ {get_ai_capability_label(capability)} ahora usa "
+                f"{get_ai_provider_label(model['provider'])} · {model['model_name']}"
+            ),
+        )
+        return
+
+    if action == 'add' and len(parts) == 4:
+        capability = parts[2]
+        provider = parts[3]
+        context.user_data[AI_PENDING_MODEL_KEY] = {
+            'capability': capability,
+            'provider': provider,
+        }
+        await send_ai_screen(
+            update,
+            context,
+            (
+                f"Envía el nombre exacto del modelo para {get_ai_capability_label(capability)} en "
+                f"{get_ai_provider_label(provider)}.\n\n"
+                "El siguiente mensaje de texto se guardará en el catálogo y quedará activo. "
+                "Si quieres cancelar, envía 'cancelar'."
+            ),
+            reply_markup=build_ai_pending_input_markup(capability, provider),
+        )
+        return
+
+    await query.answer("Acción no reconocida.", show_alert=True)
+
+
+def get_provider_env_key(provider):
+    return 'NVIDIA_API_KEY' if provider == 'nvidia' else 'OPENROUTER_API_KEY'
+
+
+def validate_ai_configuration():
+    """Valida la configuración activa de IA al iniciar el bot."""
+    configs = get_all_ai_configurations()
+    text_config = configs[AI_TEXT_CAPABILITY]
+    vision_config = configs[AI_VISION_CAPABILITY]
+
+    logging.info(
+        "Configuración IA activa | texto=%s/%s | vision=%s/%s",
+        text_config['provider'],
+        text_config['model_name'],
+        vision_config['provider'],
+        vision_config['model_name'],
+    )
+
+    for capability, config in configs.items():
+        api_key = os.getenv(get_provider_env_key(config['provider']), '')
+        if api_key and not api_key.startswith('your-'):
+            continue
+
+        message = (
+            f"La configuración de {get_ai_capability_label(capability)} usa "
+            f"{get_ai_provider_label(config['provider'])}, pero falta {get_provider_env_key(config['provider'])}."
+        )
+        if capability == AI_TEXT_CAPABILITY:
+            logging.error(message)
+            return False
+
+        logging.warning(message)
+
+    validation_text = request_ai_text(
+        [{"role": "user", "content": "di solo: ok"}],
+        timeout=15,
+        max_tokens=5,
+        log_context="startup/text_validation",
+        capability=AI_TEXT_CAPABILITY,
+    )
+    if validation_text is not None:
+        logging.info("Conexión con el proveedor activo de texto verificada correctamente")
         return True
-    if response.status_code == 401:
-        logging.error("OPENROUTER_API_KEY invalida (401 Unauthorized)")
-        return False
-    if response.status_code == 402:
-        logging.error("OpenRouter reporta falta de creditos (402 Payment Required)")
-        return False
-    if response.status_code == 403:
-        logging.error("OpenRouter rechazo la clave o permisos (403 Forbidden)")
-        return False
-    if response.status_code == 429:
-        logging.warning("OpenRouter devolvio 429 al iniciar; el bot continuara")
-        return True
-    if response.status_code in (404, 503):
+
+    failure = get_last_brain_failure() or {}
+    status_code = failure.get('status_code')
+    if failure.get('kind') in {'timeout', 'network_error'} or status_code in {429, 503}:
         logging.warning(
-            "El modelo %s puede no estar disponible al iniciar (status=%s); el bot continuara",
-            model,
-            response.status_code,
+            "No se pudo validar en caliente el proveedor activo de texto, pero el bot continuará. failure=%s",
+            json.dumps(failure, ensure_ascii=False, default=str),
         )
         return True
 
-    logging.warning(
-        "OpenRouter respondio con status=%s al iniciar. Respuesta=%s",
-        response.status_code,
-        response.text[:200],
+    logging.error(
+        "Falló la validación del proveedor activo de texto. failure=%s",
+        json.dumps(failure, ensure_ascii=False, default=str),
     )
     return False
 
@@ -579,52 +893,35 @@ async def send_daily_summaries(context: ContextTypes.DEFAULT_TYPE):
             logging.error(f"Error enviando resumen diario a {user_id}: {e}")
 
 # --- FUNCIÓN AUXILIAR: Descargar imagen de Telegram y convertir a base64 ---
-async def download_image_to_base64(update: Update) -> str | None:
-    """Descarga la imagen de un mensaje de Telegram y la convierte a base64.
-    
-    Returns:
-        String con la imagen en formato data:image/jpeg;base64,... o None si falla
-    """
+async def download_telegram_file_to_base64(bot, file_id: str, mime_type: str | None = None) -> str | None:
+    """Descarga un archivo de imagen de Telegram y lo retorna en formato data URI."""
     try:
-        # Obtener la foto (tomar la última que es la de mayor resolución)
-        photo = update.message.photo[-1] if update.message.photo else None
-        
-        if not photo:
-            # Intentar con documento
-            document = update.message.document
-            if document:
-                # Verificar si es una imagen
-                if document.mime_type and document.mime_type.startswith('image/'):
-                    photo = document
-                else:
-                    return None
-            else:
-                return None
-        
-        # Descargar la imagen
-        bot = update.message.bot
-        file = await bot.get_file(photo.file_id)
-        
-        # Descargar el contenido
+        file = await bot.get_file(file_id)
         image_content = await file.download_as_bytearray()
-        
-        # Determinar el tipo MIME
-        mime_type = "image/jpeg"
-        if photo == update.message.document:
-            # Es un documento
-            mime_type = photo.mime_type or "image/jpeg"
-        elif hasattr(photo, 'mime_type') and photo.mime_type:
-            mime_type = photo.mime_type
-        
-        # Convertir a base64
+
+        resolved_mime_type = mime_type or 'image/jpeg'
         image_base64 = base64.b64encode(image_content).decode('utf-8')
-        
-        # Retornar en formato data URI
-        return f"data:{mime_type};base64,{image_base64}"
-        
+
+        return f"data:{resolved_mime_type};base64,{image_base64}"
     except Exception as e:
-        logging.error(f"Error descargando imagen: {e}")
+        logging.error(f"Error descargando imagen {file_id}: {e}")
         return None
+
+
+async def download_image_to_base64(update: Update) -> str | None:
+    """Descarga la imagen del mensaje actual y la convierte a base64."""
+    photo = update.message.photo[-1] if update.message.photo else None
+    mime_type = 'image/jpeg'
+
+    if not photo:
+        document = update.message.document
+        if not document or not document.mime_type or not document.mime_type.startswith('image/'):
+            return None
+
+        photo = document
+        mime_type = document.mime_type or 'image/jpeg'
+
+    return await download_telegram_file_to_base64(update.message.bot, photo.file_id, mime_type=mime_type)
 
 # --- PROCESAMIENTO DE VIDEOS DE X.COM ---
 async def process_x_video(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, user_text: str):
@@ -1028,6 +1325,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Intentar obtener el texto del mensaje o de la leyenda (caption) de una imagen/archivo
     user_text = update.message.text or update.message.caption
     user_id = update.effective_user.id
+
+    if context.user_data.get(AI_PENDING_MODEL_KEY):
+        if not user_text:
+            await update.effective_message.reply_text(
+                "Estoy esperando el nombre exacto del modelo en texto o la palabra 'cancelar'."
+            )
+            return
+
+        if await handle_pending_ai_model_entry(update, context, user_text, user_id):
+            return
     
     if user_text:
         youtube_url = extract_youtube_url(user_text)
@@ -1128,10 +1435,13 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
         # Obtener el file_id de la foto (tomamos la de mayor resolución)
         if msg.photo:
             photo_id = msg.photo[-1].file_id
+            image_mime_type = 'image/jpeg'
         else:
             photo_id = msg.document.file_id
+            image_mime_type = msg.document.mime_type or 'image/jpeg'
         
         context.user_data['pending_image_id'] = photo_id
+        context.user_data['pending_image_mime_type'] = image_mime_type
         logging.info(f"Imagen recibida para usuario {user_id}: {photo_id}")
         
         # Si no hay caption de texto, solicitar que escriba qué quiere hacer
@@ -1141,6 +1451,7 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
     
     # 2. RECUPERAR IMAGE_ID PENDIENTE (si existe de un mensaje anterior)
     image_to_save = context.user_data.get('pending_image_id')
+    image_mime_type = context.user_data.get('pending_image_mime_type') or 'image/jpeg'
     
     logging.info(f"Mensaje recibido de usuario {user_id}: {user_text} (con imagen_id: {bool(image_to_save)})")
     
@@ -1166,7 +1477,28 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
         text_to_process = f"{user_text}\n[📸 El usuario adjuntó una imagen a este mensaje]"
     
     try:
-        res = process_user_input(text_to_process, history=history, active_reminders=active_reminders)
+        if image_to_save:
+            image_base64 = await download_telegram_file_to_base64(
+                update.effective_bot,
+                image_to_save,
+                mime_type=image_mime_type,
+            )
+            if image_base64:
+                res = process_vision_input(
+                    text_to_process,
+                    image_base64,
+                    history=history,
+                    active_reminders=active_reminders,
+                )
+            else:
+                logging.warning(
+                    "No se pudo descargar la imagen pendiente %s para el usuario %s; usando fallback de texto",
+                    image_to_save,
+                    user_id,
+                )
+                res = process_user_input(text_to_process, history=history, active_reminders=active_reminders)
+        else:
+            res = process_user_input(text_to_process, history=history, active_reminders=active_reminders)
         
         if not res:
             failure = get_last_brain_failure()
@@ -1229,6 +1561,8 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
             # Limpiar imagen pendiente después de guardar
             if 'pending_image_id' in context.user_data:
                 del context.user_data['pending_image_id']
+            if 'pending_image_mime_type' in context.user_data:
+                del context.user_data['pending_image_mime_type']
             
             msg_recurrence = f"\n🔁 Recurrencia: {recurrence}" if recurrence else ""
             emoji = "🖼️" if image_file_id else "✅"
@@ -1555,6 +1889,8 @@ async def nota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Limpiar imagen pendiente después de guardar
     if 'pending_image_id' in context.user_data:
         del context.user_data['pending_image_id']
+    if 'pending_image_mime_type' in context.user_data:
+        del context.user_data['pending_image_mime_type']
 
     emoji = "🖼️" if image_file_id else "✅"
     saved_category = category or UNCATEGORIZED_LABEL
@@ -1576,18 +1912,21 @@ if __name__ == '__main__':
     # Inicializar DB
     from database import init_db
     init_db()
+    seed_ai_catalog_defaults()
     logging.info("Base de datos inicializada correctamente")
-    validate_openrouter_key()
+    validate_ai_configuration()
     
     application = ApplicationBuilder().token(telegram_token).post_init(post_init).build()
     
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler(["ai", "modelo"], ai_command))
     application.add_handler(CommandHandler("nota", nota_command))
     # Nuevo: fotos/documentos-imagen con caption /nota
     application.add_handler(MessageHandler(
         (filters.PHOTO | filters.Document.IMAGE) & filters.CaptionRegex(r'^/nota'),
         nota_photo_command
     ))
+    application.add_handler(CallbackQueryHandler(ai_settings_callback_handler, pattern=r"^ai:"))
     application.add_handler(CallbackQueryHandler(x_link_callback_handler, pattern=r"^(x_|gh_|yt_)"))
     application.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & (~filters.COMMAND), handle_message))
     
