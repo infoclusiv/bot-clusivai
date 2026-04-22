@@ -66,6 +66,13 @@ let currentRecurrence = initialRecurrence;
 let activeTab = 'calendar';
 const uncategorizedLabel = 'Sin categoría';
 
+function formatLocalDate(date) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+}
+
 // ==================== INITIALIZATION ====================
 function init() {
     if (mode === 'calendar' || mode === 'notes') {
@@ -170,7 +177,7 @@ function showEditForm(message = '', dateTime = '', id = null, recurrence = null)
         timeInput.value = time.substring(0, 5);
     } else {
         const now = new Date();
-        dateInput.value = now.toISOString().split('T')[0];
+        dateInput.value = formatLocalDate(now);
         timeInput.value = now.toTimeString().substring(0, 5);
     }
 }
@@ -842,7 +849,7 @@ saveButton.addEventListener('click', async () => {
             showError('Por favor, selecciona al menos un día.');
             return;
         }
-        date = new Date().toISOString().split('T')[0];
+        date = dateInput.value || formatLocalDate(new Date());
     } else {
         if (!date) {
             showError('Por favor, selecciona una fecha.');

@@ -53,6 +53,10 @@ WEBAPP_URL = os.getenv("PUBLIC_WEBAPP_URL") or os.getenv("WEBAPP_URL")
 LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", "logs/clusivai-bot.log")
 LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", "1048576"))
 LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "5"))
+REMINDER_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+CHECK_REMINDERS_INTERVAL_SECONDS = int(os.getenv("CHECK_REMINDERS_INTERVAL_SECONDS", "15"))
+CHECK_REMINDERS_FIRST_DELAY_SECONDS = int(os.getenv("CHECK_REMINDERS_FIRST_DELAY_SECONDS", "3"))
+MAX_RECURRING_SEND_DELAY_SECONDS = int(os.getenv("MAX_RECURRING_SEND_DELAY_SECONDS", "180"))
 AI_PENDING_MODEL_KEY = 'ai_pending_model_entry'
 AI_CALLBACK_PREFIX = 'ai:'
 AI_PROVIDER_LABELS = {
@@ -64,6 +68,29 @@ AI_CAPABILITY_LABELS = {
     AI_VISION_CAPABILITY: 'Vision',
 }
 DEFAULT_NVIDIA_TEXT_MODEL = os.getenv('NVIDIA_TEXT_MODEL_NAME', 'stepfun-ai/step-3.5-flash')
+
+
+def parse_bogota_datetime(datetime_str: str, tzinfo):
+    parsed = datetime.strptime(datetime_str, REMINDER_DATETIME_FORMAT)
+    if parsed.tzinfo is None:
+        return tzinfo.localize(parsed)
+    return parsed.astimezone(tzinfo)
+
+
+def get_next_recurrence_occurrence(remind_at_str: str, recurrence: str, now, tzinfo):
+    scheduled_at = parse_bogota_datetime(remind_at_str, tzinfo)
+    scheduled_anchor = scheduled_at.replace(tzinfo=None)
+    reference_time = max(now.astimezone(tzinfo), scheduled_at).replace(tzinfo=None)
+    rule = rrule.rrulestr(recurrence, dtstart=scheduled_anchor)
+    next_occurrence = rule.after(reference_time)
+    if not next_occurrence:
+        return None
+    return tzinfo.localize(next_occurrence)
+
+
+def should_send_recurrent_reminder(scheduled_at, now):
+    delay_seconds = max(0, int((now - scheduled_at).total_seconds()))
+    return delay_seconds <= MAX_RECURRING_SEND_DELAY_SECONDS, delay_seconds
 
 
 def configure_logging():
@@ -775,18 +802,34 @@ def validate_ai_configuration():
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     tz_bogota = pytz.timezone('America/Bogota')
     now = datetime.now(tz_bogota)
-    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    now_str = now.strftime(REMINDER_DATETIME_FORMAT)
     
     conn = get_connection()
     cursor = conn.cursor()
     
     # Buscamos tareas pendientes cuya fecha ya pasó - INCLUIMOS image_file_id
-    cursor.execute('SELECT id, user_id, message, recurrence, image_file_id FROM reminders WHERE remind_at <= ? AND status = "pending"', (now_str,))
+    cursor.execute('SELECT id, user_id, message, remind_at, recurrence, image_file_id FROM reminders WHERE remind_at <= ? AND status = "pending"', (now_str,))
     due_reminders = cursor.fetchall()
     
     for rem in due_reminders:
-        rem_id, user_id, msg, recurrence, image_file_id = rem
+        rem_id, user_id, msg, remind_at_str, recurrence, image_file_id = rem
         try:
+            scheduled_at = parse_bogota_datetime(remind_at_str, tz_bogota)
+            delay_seconds = max(0, int((now - scheduled_at).total_seconds()))
+            send_current_occurrence = True
+            
+            if recurrence:
+                send_current_occurrence, delay_seconds = should_send_recurrent_reminder(scheduled_at, now)
+                if not send_current_occurrence:
+                    logging.info(
+                        "Recordatorio recurrente %s omitido por atraso: scheduled_at=%s detected_at=%s delay_seconds=%s max_delay=%s",
+                        rem_id,
+                        remind_at_str,
+                        now_str,
+                        delay_seconds,
+                        MAX_RECURRING_SEND_DELAY_SECONDS,
+                    )
+            
             alert_text = f"⏰ ¡ALERTA (ID: {rem_id})!:\n📌 {msg}"
             
             # Botón para abrir la Web App de reprogramación
@@ -797,34 +840,54 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             else:
                 reply_markup = None
 
-            # ENVÍO DE ALERTA: Si hay imagen, enviar foto; si no, enviar mensaje
-            if image_file_id:
-                await context.bot.send_photo(
-                    chat_id=user_id,
-                    photo=image_file_id,
-                    caption=alert_text,
-                    reply_markup=reply_markup
-                )
-                logging.info(f"Alerta con foto enviada al usuario {user_id} para recordatorio {rem_id}")
-            else:
-                await context.bot.send_message(
-                    chat_id=user_id, 
-                    text=alert_text,
-                    reply_markup=reply_markup
-                )
-                logging.info(f"Alerta de texto enviada al usuario {user_id} para recordatorio {rem_id}")
+            if send_current_occurrence:
+                # ENVÍO DE ALERTA: Si hay imagen, enviar foto; si no, enviar mensaje
+                if image_file_id:
+                    await context.bot.send_photo(
+                        chat_id=user_id,
+                        photo=image_file_id,
+                        caption=alert_text,
+                        reply_markup=reply_markup
+                    )
+                    logging.info(
+                        "Alerta con foto enviada al usuario %s para recordatorio %s: scheduled_at=%s detected_at=%s delay_seconds=%s",
+                        user_id,
+                        rem_id,
+                        remind_at_str,
+                        now_str,
+                        delay_seconds,
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=user_id, 
+                        text=alert_text,
+                        reply_markup=reply_markup
+                    )
+                    logging.info(
+                        "Alerta de texto enviada al usuario %s para recordatorio %s: scheduled_at=%s detected_at=%s delay_seconds=%s",
+                        user_id,
+                        rem_id,
+                        remind_at_str,
+                        now_str,
+                        delay_seconds,
+                    )
             
             if recurrence:
-                # Calcular la siguiente ocurrencia
                 try:
-                    # Parsear la regla RRULE
-                    rule = rrule.rrulestr(recurrence, dtstart=now.replace(tzinfo=None))
-                    next_occurrence = rule.after(now.replace(tzinfo=None))
+                    next_occurrence = get_next_recurrence_occurrence(remind_at_str, recurrence, now, tz_bogota)
                     
                     if next_occurrence:
-                        new_date_str = next_occurrence.strftime("%Y-%m-%d %H:%M:%S")
+                        new_date_str = next_occurrence.strftime(REMINDER_DATETIME_FORMAT)
                         cursor.execute('UPDATE reminders SET remind_at = ? WHERE id = ?', (new_date_str, rem_id))
-                        logging.info(f"Recordatorio recurrente {rem_id} reprogramado para {new_date_str}")
+                        logging.info(
+                            "Recordatorio recurrente %s reprogramado: scheduled_at=%s detected_at=%s delay_seconds=%s sent=%s next_occurrence=%s",
+                            rem_id,
+                            remind_at_str,
+                            now_str,
+                            delay_seconds,
+                            send_current_occurrence,
+                            new_date_str,
+                        )
                     else:
                         cursor.execute('UPDATE reminders SET status = "sent" WHERE id = ?', (rem_id,))
                 except Exception as ex:
@@ -833,28 +896,29 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             else:
                 cursor.execute('UPDATE reminders SET status = "sent" WHERE id = ?', (rem_id,))
             
-            # Registrar el alerta en el historial del usuario para que la IA tenga contexto
-            # Usamos context.application.user_data para acceder al historial fuera de un MessageHandler
-            if user_id in context.application.user_data:
-                user_data = context.application.user_data[user_id]
-                if 'history' not in user_data:
-                    user_data['history'] = []
-                
-                # Agregamos un mensaje ficticio del asistente que describe la alerta
-                # Esto permite que la IA vea el ID y el mensaje enviado en el historial
-                user_data['history'].append({
-                    "role": "assistant", 
-                    "content": json.dumps({
-                        "action": "ALERT", 
-                        "id": rem_id, 
-                        "message": msg,
-                        "reply": alert_text
-                    }, ensure_ascii=False)
-                })
-                
-                # Limitar historial
-                if len(user_data['history']) > 16:
-                    user_data['history'] = user_data['history'][-16:]
+            if send_current_occurrence:
+                # Registrar el alerta en el historial del usuario para que la IA tenga contexto
+                # Usamos context.application.user_data para acceder al historial fuera de un MessageHandler
+                if user_id in context.application.user_data:
+                    user_data = context.application.user_data[user_id]
+                    if 'history' not in user_data:
+                        user_data['history'] = []
+                    
+                    # Agregamos un mensaje ficticio del asistente que describe la alerta
+                    # Esto permite que la IA vea el ID y el mensaje enviado en el historial
+                    user_data['history'].append({
+                        "role": "assistant", 
+                        "content": json.dumps({
+                            "action": "ALERT", 
+                            "id": rem_id, 
+                            "message": msg,
+                            "reply": alert_text
+                        }, ensure_ascii=False)
+                    })
+                    
+                    # Limitar historial
+                    if len(user_data['history']) > 16:
+                        user_data['history'] = user_data['history'][-16:]
                     
         except Exception as e:
             logging.error(f"Error enviando mensaje: {e}")
@@ -1930,9 +1994,13 @@ if __name__ == '__main__':
     application.add_handler(CallbackQueryHandler(x_link_callback_handler, pattern=r"^(x_|gh_|yt_)"))
     application.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & (~filters.COMMAND), handle_message))
     
-    # Programar el revisor cada 60 segundos
+    # Programar el revisor de recordatorios con una cadencia corta para reducir atrasos evitables.
     job_queue = application.job_queue
-    job_queue.run_repeating(check_reminders, interval=60, first=10)
+    job_queue.run_repeating(
+        check_reminders,
+        interval=CHECK_REMINDERS_INTERVAL_SECONDS,
+        first=CHECK_REMINDERS_FIRST_DELAY_SECONDS,
+    )
     job_queue.run_repeating(poll_repo_analysis_updates, interval=1, first=1)
     
     # Programar resumen diario a las 7:45 AM Bogotá (Mon-Fri)

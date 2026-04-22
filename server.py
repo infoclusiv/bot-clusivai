@@ -4,6 +4,7 @@ import os
 import json
 import requests
 import logging
+from datetime import datetime
 from database import get_connection, update_reminder_by_id, get_user_reminders, delete_reminder_by_id, get_notes_by_user, get_note_categories_by_user, update_note, delete_note, normalize_note_category, normalize_note_subcategory_id, create_note_subcategory, delete_note_subcategory, UNCATEGORIZED_LABEL
 from dotenv import load_dotenv
 
@@ -19,6 +20,51 @@ SERVER_HOST = os.getenv('SERVER_HOST', '0.0.0.0')
 SERVER_PORT = int(os.getenv('PORT', os.getenv('SERVER_PORT', '5000')))
 LOGS_ACCESS_TOKEN = os.getenv('LOGS_ACCESS_TOKEN', '')
 LOG_FILE_PATH = os.getenv('LOG_FILE_PATH', 'logs/clusivai-bot.log')
+REMINDER_DATETIME_FORMAT = '%Y-%m-%d %H:%M:%S'
+
+
+def normalize_recurrent_reminder_date(user_id, reminder_id, new_date, new_recurrence):
+    if not (user_id and reminder_id and new_date and new_recurrence):
+        return new_date
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT remind_at FROM reminders WHERE id = ? AND user_id = ?', (reminder_id, user_id))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row or not row[0]:
+        return new_date
+
+    try:
+        existing_dt = datetime.strptime(row[0], REMINDER_DATETIME_FORMAT)
+        incoming_dt = datetime.strptime(new_date, REMINDER_DATETIME_FORMAT)
+    except ValueError:
+        logging.warning(
+            'No se pudo normalizar fecha recurrente para recordatorio %s de usuario %s: new_date=%s existing=%s',
+            reminder_id,
+            user_id,
+            new_date,
+            row[0],
+        )
+        return new_date
+
+    normalized_dt = existing_dt.replace(
+        hour=incoming_dt.hour,
+        minute=incoming_dt.minute,
+        second=incoming_dt.second,
+    )
+
+    normalized_date = normalized_dt.strftime(REMINDER_DATETIME_FORMAT)
+    if normalized_date != new_date:
+        logging.info(
+            'Fecha recurrente normalizada para recordatorio %s de usuario %s: received=%s normalized=%s',
+            reminder_id,
+            user_id,
+            new_date,
+            normalized_date,
+        )
+    return normalized_date
 
 @app.route('/')
 def index():
@@ -43,6 +89,8 @@ def reprogram():
     message = data.get('message')
     new_date = data.get('date')
     new_recurrence = data.get('recurrence') # Opcional
+
+    new_date = normalize_recurrent_reminder_date(user_id, reminder_id, new_date, new_recurrence)
 
     if not all([user_id, reminder_id, message, new_date]):
         return jsonify({"success": False, "error": "Missing data"}), 400
