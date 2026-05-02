@@ -95,6 +95,53 @@ def should_send_recurrent_reminder(scheduled_at, now):
     return delay_seconds <= MAX_RECURRING_SEND_DELAY_SECONDS, delay_seconds
 
 
+def format_reminder_date_for_reply(date_str: str) -> str:
+    try:
+        dt_obj = datetime.strptime(date_str, REMINDER_DATETIME_FORMAT)
+        dias = {
+            0: "Lunes",
+            1: "Martes",
+            2: "Miércoles",
+            3: "Jueves",
+            4: "Viernes",
+            5: "Sábado",
+            6: "Domingo",
+        }
+        return f"{dias[dt_obj.weekday()]} {date_str}"
+    except Exception:
+        return date_str
+
+
+def normalize_create_reminders(ai_result):
+    base_message = ai_result.get("message")
+    base_recurrence = ai_result.get("recurrence")
+    raw_reminders = ai_result.get("reminders")
+
+    if not isinstance(raw_reminders, list):
+        raw_reminders = [{
+            "message": base_message,
+            "date": ai_result.get("date"),
+            "recurrence": base_recurrence,
+        }]
+
+    normalized = []
+    for item in raw_reminders:
+        if not isinstance(item, dict):
+            continue
+
+        message = item.get("message") or base_message
+        if not message or not str(message).strip():
+            message = "Revisar enlace compartido"
+
+        normalized.append({
+            "message": str(message).strip(),
+            "date": item.get("date"),
+            "recurrence": item.get("recurrence", base_recurrence),
+        })
+
+    return normalized
+
+
 def configure_logging():
     handlers = [logging.StreamHandler()]
     resolved_log_path = None
@@ -1705,49 +1752,60 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
         reply_message = None
         
         if action == "CREATE":
-            recurrence = res.get("recurrence")
-            date_str = res.get("date")
-            message = res.get("message")
+            reminders_to_create = normalize_create_reminders(res)
+            reminders_to_create = [r for r in reminders_to_create if r.get("date")]
 
             # Validar que tengamos una fecha para el recordatorio
-            if not date_str:
+            if not reminders_to_create:
                 # No intentamos guardar en base de datos para evitar errores de integridad
                 await update.effective_message.reply_text(
                     "Necesito saber cuándo quieres que te recuerde esto. "
                     "Por ejemplo: \"mañana a las 9am\" o \"el viernes a las 18:00\"."
                 )
                 return
-
-            # Asegurar que el mensaje no esté vacío
-            if not message or not str(message).strip():
-                message = "Revisar enlace compartido"
             
             # Recuperar imagen pendiente (si existe)
             image_file_id = context.user_data.get('pending_image_id')
             
-            # Guardar recordatorio con imagen
-            add_reminder(user_id, message, date_str, recurrence, image_file_id)
+            # Guardar recordatorio(s) con imagen
+            for reminder in reminders_to_create:
+                add_reminder(
+                    user_id,
+                    reminder["message"],
+                    reminder["date"],
+                    reminder.get("recurrence"),
+                    image_file_id,
+                )
             
-            # Limpiar imagen pendiente después de guardar
+            # Limpiar imagen pendiente después de guardar todo el lote
             if 'pending_image_id' in context.user_data:
                 del context.user_data['pending_image_id']
             if 'pending_image_mime_type' in context.user_data:
                 del context.user_data['pending_image_mime_type']
             
-            msg_recurrence = f"\n🔁 Recurrencia: {recurrence}" if recurrence else ""
             emoji = "🖼️" if image_file_id else "✅"
-            
-            # Formatear la fecha para mostrar el día de la semana
-            try:
-                dt_obj = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
-                # Crear diccionario de días en español
-                dias = {0: "Lunes", 1: "Martes", 2: "Miércoles", 3: "Jueves", 4: "Viernes", 5: "Sábado", 6: "Domingo"}
-                dia_semana = dias[dt_obj.weekday()]
-                fecha_formateada = f"{dia_semana} {date_str}"
-            except Exception:
-                fecha_formateada = date_str
-            
-            reply_message = f"{emoji} ¡Perfecto! He guardado tu recordatorio:\n\n📍 {message}\n📅 {fecha_formateada}{msg_recurrence}"
+
+            if len(reminders_to_create) == 1:
+                reminder = reminders_to_create[0]
+                msg_recurrence = f"\n🔁 Recurrencia: {reminder.get('recurrence')}" if reminder.get("recurrence") else ""
+                fecha_formateada = format_reminder_date_for_reply(reminder["date"])
+                reply_message = (
+                    f"{emoji} ¡Perfecto! He guardado tu recordatorio:\n\n"
+                    f"📍 {reminder['message']}\n📅 {fecha_formateada}{msg_recurrence}"
+                )
+            else:
+                reminder_lines = []
+                for reminder in reminders_to_create:
+                    fecha_formateada = format_reminder_date_for_reply(reminder["date"])
+                    recurrence_text = f"\n🔁 {reminder.get('recurrence')}" if reminder.get("recurrence") else ""
+                    reminder_lines.append(
+                        f"📍 {reminder['message']}\n📅 {fecha_formateada}{recurrence_text}"
+                    )
+
+                reply_message = (
+                    f"{emoji} ¡Perfecto! He guardado {len(reminders_to_create)} recordatorios:\n\n"
+                    + "\n\n".join(reminder_lines)
+                )
             
         elif action == "LIST":
             # Cambiamos para mostrar solo el botón del calendario, no la lista larga de texto

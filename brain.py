@@ -868,6 +868,9 @@ def process_user_input(text, history=None, active_reminders=None):
         "message": "descripción de la tarea (solo para recordatorios)",
         "date": "YYYY-MM-DD HH:MM:SS" (fecha calculada para CREATE o UPDATE),
         "recurrence": "cadena RRULE (solo si es recurrente, ej: FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR) o null",
+        "reminders": [
+            {{"message": "descripción", "date": "YYYY-MM-DD HH:MM:SS", "recurrence": "RRULE o null"}}
+        ] (opcional, solo para CREATE cuando debas crear varios recordatorios),
         "reply": "Tu respuesta directa si la acción es CHAT o confirmación de acción"
     }}
 
@@ -877,6 +880,9 @@ def process_user_input(text, history=None, active_reminders=None):
     - Si el usuario saluda o pregunta algo general (como "¿qué hora es?"), usa action: "CHAT".
     - Si quiere ver sus recordatorios ("mis recordatorios", "lista", "cuáles tengo"), usa action: "LIST".
     - Si quiere crear un recordatorio, usa action: "CREATE" con la descripción de la tarea.
+    - REGLA CRÍTICA SOBRE VARIAS HORAS: Si el usuario pide un mismo recordatorio en varias horas, responde con action: "CREATE" y usa el campo "reminders" con una entrada por cada hora. Cada entrada debe tener su propia "date" con esa hora exacta y la misma "recurrence" si aplica. No mezcles varias horas en una sola entrada.
+      Ejemplo: "los sábados y domingos recuérdame tomar ensure a las 10 am y a las 5:30 pm" -> {{"action":"CREATE","message":"tomar ensure","reminders":[{{"message":"tomar ensure","date":"2026-05-02 10:00:00","recurrence":"FREQ=WEEKLY;BYDAY=SA,SU"}},{{"message":"tomar ensure","date":"2026-05-02 17:30:00","recurrence":"FREQ=WEEKLY;BYDAY=SA,SU"}}]}}
+      Ejemplo: "recuérdame entrenar lunes 9am y miércoles 6pm" -> usa "reminders" con una entrada para el lunes a las 09:00 y otra para el miércoles a las 18:00, con la recurrencia que corresponda a cada día si el usuario pidió repetición.
     - Si la instrucción implica repetición (ej: "diario", "todos los lunes", "cada semana", "lunes a viernes"), genera en el campo "recurrence" una regla RRULE válida (formato iCalendar).
       Ejemplos:
       "lunes a viernes a las 5pm" -> "FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR"
@@ -1011,17 +1017,22 @@ def process_vision_input(text, image_base64, history=None, active_reminders=None
         "message": "descripción de la tarea (solo para recordatorios)",
         "date": "YYYY-MM-DD HH:MM:SS" (fecha calculada para CREATE o UPDATE),
         "recurrence": "cadena RRULE (solo si es recurrente) o null",
+        "reminders": [
+            {{"message": "descripción", "date": "YYYY-MM-DD HH:MM:SS", "recurrence": "RRULE o null"}}
+        ] (opcional, solo para CREATE cuando debas crear varios recordatorios),
         "reply": "Tu respuesta directa si la acción es CHAT o confirmación de acción"
     }}
 
     Reglas para crear recordatorios desde imágenes:
     - Si el usuario dice "recuérdame esto", "guarda esto", o algo similar, crea un recordatorio con action: "CREATE"
     - La descripción del recordatorio debe incluir lo que vez en la imagen (texto, información relevante, etc.)
+    - Si el usuario pide el mismo recordatorio en varias horas, usa "reminders" con una entrada por cada hora; cada entrada debe tener su propia fecha/hora y la misma recurrencia si aplica.
     - Si no hay instrucción clara pero hay una imagen, pregunta al usuario qué quiere hacer con ella
     
     Ejemplos:
     - Usuario envía imagen de una factura con texto "Pagar el 15" → CREATE con message: "Pagar factura (texto de imagen: [contenido])"
     - Usuario envía imagen y dice "recuérdame revisar esto mañana" → CREATE con message basado en la imagen
+    - Usuario dice "recuérdame esto sábados y domingos a las 10am y 5:30pm" → CREATE con "reminders" de dos entradas, una a las 10:00 y otra a las 17:30
     """
 
     # Construir mensaje con contenido multimodal (texto + imagen)
