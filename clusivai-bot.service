@@ -5,11 +5,11 @@ After=network.target
 [Service]
 Type=simple
 User=clusiv
-WorkingDirectory=/home/clusiv/bot-recordatorios
-ExecStart=/home/clusiv/bot-recordatorios/venv/bin/python3 /home/clusiv/bot-recordatorios/bot.py
+WorkingDirectory=/home/clusiv/bot-clusivai
+ExecStart=/home/clusiv/bot-clusivai/venv/bin/python3 /home/clusiv/bot-clusivai/bot.py
 Restart=always
 RestartSec=10
-EnvironmentFile=/home/clusiv/bot-recordatorios/.env
+EnvironmentFile=/home/clusiv/bot-clusivai/.env
 
 [Install]
 WantedBy=multi-user.target

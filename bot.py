@@ -4,6 +4,8 @@ import logging
 import json
 import queue
 import re
+import shutil
+import tempfile
 import urllib.parse
 import uuid
 import pytz
@@ -37,7 +39,7 @@ from database import (AI_TEXT_CAPABILITY, AI_VISION_CAPABILITY, UNCATEGORIZED_LA
                       normalize_note_category, save_ai_model,
                       set_daily_summary, update_reminder_by_id)
 from repo_analysis_worker import run_repository_analysis_worker
-from video_handler import extract_x_url, download_audio, transcribe_audio, cleanup_audio
+from video_handler import MAX_AUDIO_SIZE_BYTES, extract_x_url, download_audio, transcribe_audio, cleanup_audio
 from repo_handler import extract_github_repo_url
 from youtube_handler import (
     fetch_available_languages as fetch_youtube_available_languages,
@@ -972,6 +974,35 @@ async def download_telegram_file_to_base64(bot, file_id: str, mime_type: str | N
         return None
 
 
+async def download_telegram_file_to_temp_path(
+    bot,
+    file_id: str,
+    *,
+    suffix: str = '.ogg',
+    prefix: str = 'clusivai_voice_',
+) -> str | None:
+    """Descarga un archivo binario de Telegram a un archivo temporal local."""
+    temp_dir = None
+    temp_path = None
+
+    try:
+        file = await bot.get_file(file_id)
+        file_content = await file.download_as_bytearray()
+
+        temp_dir = tempfile.mkdtemp(prefix=prefix)
+        temp_path = os.path.join(temp_dir, f'audio{suffix}')
+
+        with open(temp_path, 'wb') as temp_file:
+            temp_file.write(file_content)
+
+        return temp_path
+    except Exception as e:
+        logging.error(f"Error descargando archivo de Telegram {file_id}: {e}")
+        if temp_dir and os.path.isdir(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        return None
+
+
 async def download_image_to_base64(update: Update) -> str | None:
     """Descarga la imagen del mensaje actual y la convierte a base64."""
     photo = update.message.photo[-1] if update.message.photo else None
@@ -1385,6 +1416,81 @@ def split_message(text, max_length=4096):
     return chunks
 
 # --- MANEJADOR DE MENSAJES ---
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    voice = msg.voice if msg else None
+    user = update.effective_user
+    user_id = user.id if user else None
+    audio_path = None
+    status_msg = None
+
+    if context.user_data.get(AI_PENDING_MODEL_KEY):
+        await update.effective_message.reply_text(
+            "Estoy esperando el nombre exacto del modelo en texto o la palabra 'cancelar'."
+        )
+        return
+
+    if not msg or not voice or user_id is None:
+        return
+
+    logging.info(
+        "Nota de voz recibida de usuario %s: duration=%ss size_bytes=%s",
+        user_id,
+        voice.duration,
+        voice.file_size,
+    )
+
+    if voice.file_size and voice.file_size > MAX_AUDIO_SIZE_BYTES:
+        size_mb = voice.file_size / (1024 * 1024)
+        await msg.reply_text(
+            f"❌ Tu audio es demasiado grande ({size_mb:.1f} MB). Envíame una nota de voz más corta."
+        )
+        return
+
+    try:
+        status_msg = await msg.reply_text("🎙️ Transcribiendo tu audio...")
+        audio_path = await download_telegram_file_to_temp_path(
+            context.bot,
+            voice.file_id,
+            suffix='.ogg',
+        )
+
+        if not audio_path:
+            await status_msg.edit_text("❌ No pude descargar tu audio. Intenta de nuevo.")
+            return
+
+        transcript, error = transcribe_audio(audio_path)
+        if transcript is None:
+            await status_msg.edit_text(f"❌ {error}")
+            return
+
+        logging.info(
+            "Nota de voz transcrita para usuario %s: %s",
+            user_id,
+            transcript[:200].replace('\n', ' '),
+        )
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+        await process_normal_message(update, context, transcript, user_id)
+    except Exception as e:
+        logging.error(f"Error procesando nota de voz para usuario {user_id}: {e}", exc_info=True)
+        if status_msg:
+            try:
+                await status_msg.edit_text("❌ Hubo un error inesperado procesando tu audio. Intenta de nuevo.")
+                return
+            except Exception:
+                pass
+
+        await msg.reply_text("❌ Hubo un error inesperado procesando tu audio. Intenta de nuevo.")
+    finally:
+        if audio_path:
+            cleanup_audio(audio_path)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Intentar obtener el texto del mensaje o de la leyenda (caption) de una imagen/archivo
     user_text = update.message.text or update.message.caption
@@ -1543,7 +1649,7 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
     try:
         if image_to_save:
             image_base64 = await download_telegram_file_to_base64(
-                update.effective_bot,
+                context.bot,
                 image_to_save,
                 mime_type=image_mime_type,
             )
@@ -1992,6 +2098,7 @@ if __name__ == '__main__':
     ))
     application.add_handler(CallbackQueryHandler(ai_settings_callback_handler, pattern=r"^ai:"))
     application.add_handler(CallbackQueryHandler(x_link_callback_handler, pattern=r"^(x_|gh_|yt_)"))
+    application.add_handler(MessageHandler(filters.VOICE & (~filters.COMMAND), handle_voice_message))
     application.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & (~filters.COMMAND), handle_message))
     
     # Programar el revisor de recordatorios con una cadencia corta para reducir atrasos evitables.

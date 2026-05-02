@@ -21,6 +21,26 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 # Límite de archivo para Groq Whisper API (25 MB)
 MAX_AUDIO_SIZE_BYTES = 25 * 1024 * 1024
 
+SUPPORTED_AUDIO_MIME_TYPES = {
+    '.flac': 'audio/flac',
+    '.m4a': 'audio/m4a',
+    '.mp3': 'audio/mpeg',
+    '.mp4': 'audio/mp4',
+    '.mpeg': 'audio/mpeg',
+    '.mpga': 'audio/mpeg',
+    '.oga': 'audio/ogg',
+    '.ogg': 'audio/ogg',
+    '.opus': 'audio/ogg',
+    '.wav': 'audio/wav',
+    '.webm': 'audio/webm',
+}
+
+
+def get_audio_mime_type(audio_path):
+    """Resuelve el MIME type apropiado para el archivo de audio a subir."""
+    extension = os.path.splitext(audio_path)[1].lower()
+    return SUPPORTED_AUDIO_MIME_TYPES.get(extension, 'application/octet-stream')
+
 
 def extract_x_url(text):
     """Detecta y extrae una URL de X.com o Twitter.com de un texto.
@@ -149,7 +169,7 @@ def transcribe_audio(audio_path):
     """Transcribe un archivo de audio usando la API de Groq (Whisper).
     
     Args:
-        audio_path: Ruta al archivo de audio (.mp3).
+        audio_path: Ruta al archivo de audio en un formato soportado por Groq.
     
     Returns:
         Tupla (transcript_text, None) en caso de éxito.
@@ -167,10 +187,18 @@ def transcribe_audio(audio_path):
     try:
         file_size = os.path.getsize(audio_path)
         logger.info(f"Transcribiendo audio: {audio_path} ({file_size / 1024:.1f} KB)")
+
+        if file_size > MAX_AUDIO_SIZE_BYTES:
+            size_mb = file_size / (1024 * 1024)
+            return None, f"El audio es demasiado grande ({size_mb:.1f} MB). El límite es 25 MB."
         
         with open(audio_path, 'rb') as audio_file:
             files = {
-                'file': (os.path.basename(audio_path), audio_file, 'audio/mpeg')
+                'file': (
+                    os.path.basename(audio_path),
+                    audio_file,
+                    get_audio_mime_type(audio_path),
+                )
             }
             data = {
                 'model': 'whisper-large-v3-turbo',
@@ -200,7 +228,7 @@ def transcribe_audio(audio_path):
         transcript = result.get('text', '').strip()
         
         if not transcript:
-            return None, "La transcripción está vacía. El video podría no tener audio hablado."
+            return None, "La transcripción está vacía. El audio podría no contener voz clara."
         
         logger.info(f"Transcripción exitosa: {len(transcript)} caracteres")
         return transcript, None
@@ -228,8 +256,15 @@ def cleanup_audio(audio_path):
             os.remove(audio_path)
             logger.info(f"Archivo de audio eliminado: {audio_path}")
             
-            # También eliminar el directorio temporal si está en /tmp/
-            if os.path.isdir(dir_path) and dir_path.startswith(tempfile.gettempdir()):
+            # También eliminar el directorio temporal si fue creado por este módulo.
+            resolved_temp_root = os.path.realpath(tempfile.gettempdir())
+            resolved_dir_path = os.path.realpath(dir_path)
+            dir_name = os.path.basename(resolved_dir_path.rstrip(os.sep))
+            if (
+                os.path.isdir(dir_path)
+                and os.path.commonpath([resolved_dir_path, resolved_temp_root]) == resolved_temp_root
+                and dir_name.startswith(('clusivai_audio_', 'clusivai_voice_'))
+            ):
                 shutil.rmtree(dir_path, ignore_errors=True)
                 logger.info(f"Directorio temporal eliminado: {dir_path}")
     except Exception as e:
