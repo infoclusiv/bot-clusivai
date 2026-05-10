@@ -30,14 +30,16 @@ from brain import (
     process_vision_input,
     request_ai_text,
 )
-from database import (AI_TEXT_CAPABILITY, AI_VISION_CAPABILITY, UNCATEGORIZED_LABEL,
+from database import (AI_ANALYSIS_CAPABILITY, AI_CAPABILITY_ORDER,
+                      AI_TEXT_CAPABILITY, AI_TRANSCRIPT_CAPABILITY,
+                      AI_VISION_CAPABILITY, UNCATEGORIZED_LABEL,
                       activate_ai_model, add_reminder, create_note,
                       delete_reminder_by_text, ensure_default_ai_settings,
                       get_ai_model_by_id, get_connection, get_notes_by_user,
-                      get_saved_ai_models, get_today_reminders,
-                      get_user_reminders, get_users_with_daily_summary,
-                      normalize_note_category, save_ai_model,
-                      set_daily_summary, update_reminder_by_id)
+                      get_saved_ai_models, get_supported_ai_providers_for_capability,
+                      get_today_reminders, get_user_reminders,
+                      get_users_with_daily_summary, normalize_note_category,
+                      save_ai_model, set_daily_summary, update_reminder_by_id)
 from repo_analysis_worker import run_repository_analysis_worker
 from video_handler import MAX_AUDIO_SIZE_BYTES, extract_x_url, download_audio, transcribe_audio, cleanup_audio
 from repo_handler import extract_github_repo_url
@@ -64,10 +66,19 @@ AI_CALLBACK_PREFIX = 'ai:'
 AI_PROVIDER_LABELS = {
     'openrouter': 'OpenRouter',
     'nvidia': 'Nvidia',
+    'groq': 'Groq',
 }
 AI_CAPABILITY_LABELS = {
     AI_TEXT_CAPABILITY: 'Texto',
-    AI_VISION_CAPABILITY: 'Vision',
+    AI_ANALYSIS_CAPABILITY: 'Análisis',
+    AI_VISION_CAPABILITY: 'Visión',
+    AI_TRANSCRIPT_CAPABILITY: 'Transcripción',
+}
+AI_CAPABILITY_DESCRIPTIONS = {
+    AI_TEXT_CAPABILITY: 'Chat y recordatorios',
+    AI_ANALYSIS_CAPABILITY: 'Videos de YouTube/X.com y repositorios',
+    AI_VISION_CAPABILITY: 'Imágenes',
+    AI_TRANSCRIPT_CAPABILITY: 'Audio/video a texto',
 }
 DEFAULT_NVIDIA_TEXT_MODEL = os.getenv('NVIDIA_TEXT_MODEL_NAME', 'stepfun-ai/step-3.5-flash')
 
@@ -513,19 +524,30 @@ def clear_pending_ai_model_entry(context):
 def seed_ai_catalog_defaults():
     ensure_default_ai_settings(get_default_ai_settings())
     save_ai_model('nvidia', AI_TEXT_CAPABILITY, DEFAULT_NVIDIA_TEXT_MODEL)
+    save_ai_model('nvidia', AI_ANALYSIS_CAPABILITY, DEFAULT_NVIDIA_TEXT_MODEL)
+    save_ai_model(
+        'groq',
+        AI_TRANSCRIPT_CAPABILITY,
+        os.getenv('TRANSCRIPT_MODEL_NAME', 'whisper-large-v3-turbo'),
+    )
 
 
 def build_ai_status_text(notice=None):
     configs = get_all_ai_configurations()
-    text_config = configs[AI_TEXT_CAPABILITY]
-    vision_config = configs[AI_VISION_CAPABILITY]
 
     lines = [
         "⚙️ Configuración global de IA",
         "",
-        f"Texto: {get_ai_provider_label(text_config['provider'])} · {text_config['model_name']}",
-        f"Visión: {get_ai_provider_label(vision_config['provider'])} · {vision_config['model_name']}",
     ]
+
+    for capability in AI_CAPABILITY_ORDER:
+        config = configs[capability]
+        description = AI_CAPABILITY_DESCRIPTIONS.get(capability, "")
+        suffix = f" — {description}" if description else ""
+        lines.append(
+            f"{get_ai_capability_label(capability)}: "
+            f"{get_ai_provider_label(config['provider'])} · {config['model_name']}{suffix}"
+        )
 
     if notice:
         lines.extend(["", notice])
@@ -536,7 +558,9 @@ def build_ai_status_text(notice=None):
 def build_ai_main_markup():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📝 Configurar texto", callback_data=f"{AI_CALLBACK_PREFIX}scope:{AI_TEXT_CAPABILITY}")],
+        [InlineKeyboardButton("🧠 Configurar análisis", callback_data=f"{AI_CALLBACK_PREFIX}scope:{AI_ANALYSIS_CAPABILITY}")],
         [InlineKeyboardButton("🖼️ Configurar visión", callback_data=f"{AI_CALLBACK_PREFIX}scope:{AI_VISION_CAPABILITY}")],
+        [InlineKeyboardButton("🎙️ Configurar transcripción", callback_data=f"{AI_CALLBACK_PREFIX}scope:{AI_TRANSCRIPT_CAPABILITY}")],
         [InlineKeyboardButton("🔄 Actualizar", callback_data=f"{AI_CALLBACK_PREFIX}menu")],
     ])
 
@@ -544,14 +568,21 @@ def build_ai_main_markup():
 def build_ai_capability_text(capability, notice=None):
     configs = get_all_ai_configurations()
     config = configs[capability]
+    description = AI_CAPABILITY_DESCRIPTIONS.get(capability)
     lines = [
         f"⚙️ Configuración de {get_ai_capability_label(capability)}",
         "",
+    ]
+
+    if description:
+        lines.append(f"Uso: {description}")
+
+    lines.extend([
         f"Proveedor activo: {get_ai_provider_label(config['provider'])}",
         f"Modelo activo: {config['model_name']}",
         "",
         "Elige el proveedor para ver y activar modelos guardados.",
-    ]
+    ])
 
     if notice:
         lines.extend(["", notice])
@@ -560,13 +591,20 @@ def build_ai_capability_text(capability, notice=None):
 
 
 def build_ai_capability_markup(capability):
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("OpenRouter", callback_data=f"{AI_CALLBACK_PREFIX}provider:{capability}:openrouter"),
-            InlineKeyboardButton("Nvidia", callback_data=f"{AI_CALLBACK_PREFIX}provider:{capability}:nvidia"),
-        ],
-        [InlineKeyboardButton("🏠 Menú", callback_data=f"{AI_CALLBACK_PREFIX}menu")],
-    ])
+    rows = []
+    provider_buttons = [
+        InlineKeyboardButton(
+            get_ai_provider_label(provider),
+            callback_data=f"{AI_CALLBACK_PREFIX}provider:{capability}:{provider}",
+        )
+        for provider in get_supported_ai_providers_for_capability(capability)
+    ]
+
+    for index in range(0, len(provider_buttons), 2):
+        rows.append(provider_buttons[index:index + 2])
+
+    rows.append([InlineKeyboardButton("🏠 Menú", callback_data=f"{AI_CALLBACK_PREFIX}menu")])
+    return InlineKeyboardMarkup(rows)
 
 
 def build_ai_model_picker_text(capability, provider, notice=None):
@@ -789,22 +827,21 @@ async def ai_settings_callback_handler(update: Update, context: ContextTypes.DEF
 
 
 def get_provider_env_key(provider):
-    return 'NVIDIA_API_KEY' if provider == 'nvidia' else 'OPENROUTER_API_KEY'
+    if provider == 'nvidia':
+        return 'NVIDIA_API_KEY'
+    if provider == 'groq':
+        return 'GROQ_API_KEY'
+    return 'OPENROUTER_API_KEY'
 
 
 def validate_ai_configuration():
     """Valida la configuración activa de IA al iniciar el bot."""
     configs = get_all_ai_configurations()
-    text_config = configs[AI_TEXT_CAPABILITY]
-    vision_config = configs[AI_VISION_CAPABILITY]
-
-    logging.info(
-        "Configuración IA activa | texto=%s/%s | vision=%s/%s",
-        text_config['provider'],
-        text_config['model_name'],
-        vision_config['provider'],
-        vision_config['model_name'],
+    summary = " | ".join(
+        f"{capability}={config['provider']}/{config['model_name']}"
+        for capability, config in configs.items()
     )
+    logging.info("Configuración IA activa | %s", summary)
 
     for capability, config in configs.items():
         api_key = os.getenv(get_provider_env_key(config['provider']), '')

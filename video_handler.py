@@ -1,7 +1,6 @@
 """
 video_handler.py
-Módulo para descargar audio de videos de X.com, transcribir con Groq Whisper
-y preparar el contenido para análisis.
+Módulo para descargar audio de videos de X.com y prepararlo para análisis.
 """
 
 import os
@@ -11,12 +10,11 @@ import tempfile
 import shutil
 import requests
 from dotenv import load_dotenv
+from transcription_service import transcribe_audio_with_active_provider
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # Límite de archivo para Groq Whisper API (25 MB)
 MAX_AUDIO_SIZE_BYTES = 25 * 1024 * 1024
@@ -166,82 +164,16 @@ def download_audio(url):
 
 
 def transcribe_audio(audio_path):
-    """Transcribe un archivo de audio usando la API de Groq (Whisper).
+    """Transcribe un archivo de audio usando el proveedor activo de transcript.
     
     Args:
-        audio_path: Ruta al archivo de audio en un formato soportado por Groq.
+        audio_path: Ruta al archivo de audio en un formato soportado.
     
     Returns:
         Tupla (transcript_text, None) en caso de éxito.
         Tupla (None, error_message) en caso de error.
     """
-    if not GROQ_API_KEY:
-        logger.error("GROQ_API_KEY no está configurado en las variables de entorno")
-        return None, "Error de configuración: GROQ_API_KEY no está definido."
-    
-    url = "https://api.groq.com/openai/v1/audio/transcriptions"
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}"
-    }
-    
-    try:
-        file_size = os.path.getsize(audio_path)
-        logger.info(f"Transcribiendo audio: {audio_path} ({file_size / 1024:.1f} KB)")
-
-        if file_size > MAX_AUDIO_SIZE_BYTES:
-            size_mb = file_size / (1024 * 1024)
-            return None, f"El audio es demasiado grande ({size_mb:.1f} MB). El límite es 25 MB."
-        
-        with open(audio_path, 'rb') as audio_file:
-            files = {
-                'file': (
-                    os.path.basename(audio_path),
-                    audio_file,
-                    get_audio_mime_type(audio_path),
-                )
-            }
-            data = {
-                'model': 'whisper-large-v3-turbo',
-                # No especificamos 'language' para permitir autodetección
-                'response_format': 'json',
-            }
-            
-            response = requests.post(
-                url, 
-                headers=headers, 
-                files=files, 
-                data=data, 
-                timeout=120  # 2 minutos timeout para archivos grandes
-            )
-        
-        if response.status_code == 413:
-            return None, "El archivo de audio es demasiado grande para la API de transcripción."
-        
-        if response.status_code == 429:
-            return None, "Se excedió el límite de la API de transcripción. Intenta de nuevo en unos minutos."
-        
-        if response.status_code != 200:
-            logger.error(f"Groq API error: {response.status_code} - {response.text[:300]}")
-            return None, f"Error en la transcripción (código {response.status_code}). Intenta de nuevo."
-        
-        result = response.json()
-        transcript = result.get('text', '').strip()
-        
-        if not transcript:
-            return None, "La transcripción está vacía. El audio podría no contener voz clara."
-        
-        logger.info(f"Transcripción exitosa: {len(transcript)} caracteres")
-        return transcript, None
-        
-    except requests.exceptions.Timeout:
-        logger.error("Timeout al transcribir audio (120s)")
-        return None, "La transcripción tardó demasiado. Intenta con un video más corto."
-    except requests.exceptions.ConnectionError:
-        logger.error("Error de conexión con Groq API")
-        return None, "Error de conexión con el servicio de transcripción."
-    except Exception as e:
-        logger.error(f"Error inesperado transcribiendo audio: {e}", exc_info=True)
-        return None, f"Error inesperado al transcribir: {str(e)[:100]}"
+    return transcribe_audio_with_active_provider(audio_path, get_audio_mime_type, timeout=120)
 
 
 def cleanup_audio(audio_path):

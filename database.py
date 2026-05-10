@@ -5,9 +5,22 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, 'reminders.db')
 UNCATEGORIZED_LABEL = 'Sin categoría'
 AI_TEXT_CAPABILITY = 'text'
+AI_ANALYSIS_CAPABILITY = 'analysis'
 AI_VISION_CAPABILITY = 'vision'
-SUPPORTED_AI_CAPABILITIES = (AI_TEXT_CAPABILITY, AI_VISION_CAPABILITY)
-SUPPORTED_AI_PROVIDERS = ('openrouter', 'nvidia')
+AI_TRANSCRIPT_CAPABILITY = 'transcript'
+AI_CAPABILITY_ORDER = (
+    AI_TEXT_CAPABILITY,
+    AI_ANALYSIS_CAPABILITY,
+    AI_VISION_CAPABILITY,
+    AI_TRANSCRIPT_CAPABILITY,
+)
+SUPPORTED_AI_CAPABILITIES = AI_CAPABILITY_ORDER
+SUPPORTED_AI_PROVIDERS = ('openrouter', 'nvidia', 'groq')
+AI_PROVIDER_CAPABILITIES = {
+    'openrouter': AI_CAPABILITY_ORDER[:3],
+    'nvidia': AI_CAPABILITY_ORDER[:3],
+    'groq': (AI_TRANSCRIPT_CAPABILITY,),
+}
 
 
 def get_connection():
@@ -100,6 +113,29 @@ def normalize_ai_model_name(model_name):
         raise ValueError('El nombre del modelo es obligatorio.')
 
     return normalized
+
+
+def provider_supports_capability(provider, capability):
+    """Indica si un proveedor soporta una capacidad de IA concreta."""
+    normalized_provider = normalize_ai_provider(provider)
+    normalized_capability = normalize_ai_capability(capability)
+    return normalized_capability in AI_PROVIDER_CAPABILITIES.get(normalized_provider, ())
+
+
+def validate_provider_capability(provider, capability):
+    """Valida que un proveedor sea compatible con la capacidad seleccionada."""
+    if not provider_supports_capability(provider, capability):
+        raise ValueError('El proveedor seleccionado no soporta esa capacidad de IA.')
+
+
+def get_supported_ai_providers_for_capability(capability):
+    """Retorna los proveedores soportados para una capacidad, preservando el orden global."""
+    normalized_capability = normalize_ai_capability(capability)
+    return [
+        provider
+        for provider in SUPPORTED_AI_PROVIDERS
+        if normalized_capability in AI_PROVIDER_CAPABILITIES.get(provider, ())
+    ]
 
 
 def max_timestamp(first_value, second_value):
@@ -441,6 +477,7 @@ def ensure_default_ai_settings(default_settings):
         normalized_capability = normalize_ai_capability(capability)
         provider = normalize_ai_provider(raw_config.get('provider'))
         model_name = normalize_ai_model_name(raw_config.get('model_name'))
+        validate_provider_capability(provider, normalized_capability)
 
         cursor.execute(
             '''
@@ -509,6 +546,7 @@ def save_ai_model(provider, capability, model_name):
     normalized_provider = normalize_ai_provider(provider)
     normalized_capability = normalize_ai_capability(capability)
     normalized_model_name = normalize_ai_model_name(model_name)
+    validate_provider_capability(normalized_provider, normalized_capability)
 
     conn = get_connection()
     cursor = conn.cursor()
@@ -595,6 +633,7 @@ def activate_ai_model(capability, provider, model_name):
     normalized_capability = normalize_ai_capability(capability)
     normalized_provider = normalize_ai_provider(provider)
     normalized_model_name = normalize_ai_model_name(model_name)
+    validate_provider_capability(normalized_provider, normalized_capability)
 
     conn = get_connection()
     cursor = conn.cursor()

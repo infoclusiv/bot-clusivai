@@ -10,18 +10,31 @@ import threading
 import time
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from database import AI_TEXT_CAPABILITY, AI_VISION_CAPABILITY, get_ai_setting
+from database import (
+    AI_ANALYSIS_CAPABILITY,
+    AI_CAPABILITY_ORDER,
+    AI_TEXT_CAPABILITY,
+    AI_TRANSCRIPT_CAPABILITY,
+    AI_VISION_CAPABILITY,
+    get_ai_setting,
+)
 
 load_dotenv()
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 MODEL_NAME = os.getenv("MODEL_NAME")
+ANALYSIS_MODEL_NAME = os.getenv("ANALYSIS_MODEL_NAME")
 VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME")
+TRANSCRIPT_MODEL_NAME = os.getenv("TRANSCRIPT_MODEL_NAME")
 DEFAULT_TEXT_PROVIDER = os.getenv("DEFAULT_TEXT_PROVIDER", "openrouter")
+DEFAULT_ANALYSIS_PROVIDER = os.getenv("DEFAULT_ANALYSIS_PROVIDER", "openrouter")
 DEFAULT_VISION_PROVIDER = os.getenv("DEFAULT_VISION_PROVIDER", "openrouter")
+DEFAULT_TRANSCRIPT_PROVIDER = os.getenv("DEFAULT_TRANSCRIPT_PROVIDER", "groq")
 DEFAULT_TEXT_MODEL = MODEL_NAME or "stepfun/step-3.5-flash:free"
+DEFAULT_ANALYSIS_MODEL = ANALYSIS_MODEL_NAME or MODEL_NAME or "stepfun/step-3.5-flash:free"
 DEFAULT_VISION_MODEL = VISION_MODEL_NAME or "nvidia/nemotron-nano-12b-v2-vl:free"
+DEFAULT_TRANSCRIPT_MODEL = TRANSCRIPT_MODEL_NAME or "whisper-large-v3-turbo"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 TRANSIENT_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
@@ -92,7 +105,7 @@ def _record_brain_failure(kind, context_label, **details):
 
 def _coerce_provider_name(provider_name, fallback="openrouter"):
     normalized = str(provider_name or fallback).strip().lower()
-    if normalized in {"openrouter", "nvidia"}:
+    if normalized in {"openrouter", "nvidia", "groq"}:
         return normalized
 
     logger.warning(
@@ -111,10 +124,22 @@ def get_default_ai_settings():
             "model_name": os.getenv("MODEL_NAME") or DEFAULT_TEXT_MODEL,
             "source": "default",
         },
+        AI_ANALYSIS_CAPABILITY: {
+            "capability": AI_ANALYSIS_CAPABILITY,
+            "provider": _coerce_provider_name(DEFAULT_ANALYSIS_PROVIDER, fallback="openrouter"),
+            "model_name": os.getenv("ANALYSIS_MODEL_NAME") or DEFAULT_ANALYSIS_MODEL,
+            "source": "default",
+        },
         AI_VISION_CAPABILITY: {
             "capability": AI_VISION_CAPABILITY,
             "provider": _coerce_provider_name(DEFAULT_VISION_PROVIDER, fallback="openrouter"),
             "model_name": os.getenv("VISION_MODEL_NAME") or DEFAULT_VISION_MODEL,
+            "source": "default",
+        },
+        AI_TRANSCRIPT_CAPABILITY: {
+            "capability": AI_TRANSCRIPT_CAPABILITY,
+            "provider": _coerce_provider_name(DEFAULT_TRANSCRIPT_PROVIDER, fallback="groq"),
+            "model_name": os.getenv("TRANSCRIPT_MODEL_NAME") or DEFAULT_TRANSCRIPT_MODEL,
             "source": "default",
         },
     }
@@ -141,8 +166,8 @@ def get_ai_configuration(capability):
 
 def get_all_ai_configurations():
     return {
-        AI_TEXT_CAPABILITY: get_ai_configuration(AI_TEXT_CAPABILITY),
-        AI_VISION_CAPABILITY: get_ai_configuration(AI_VISION_CAPABILITY),
+        capability: get_ai_configuration(capability)
+        for capability in AI_CAPABILITY_ORDER
     }
 
 
@@ -150,6 +175,8 @@ def get_provider_api_key(provider):
     normalized_provider = _coerce_provider_name(provider)
     if normalized_provider == "nvidia":
         return os.getenv("NVIDIA_API_KEY") or NVIDIA_API_KEY
+    if normalized_provider == "groq":
+        return os.getenv("GROQ_API_KEY")
     return os.getenv("OPENROUTER_API_KEY") or OPENROUTER_API_KEY
 
 
@@ -167,6 +194,22 @@ def get_vision_model():
 
 def get_vision_provider():
     return get_ai_configuration(AI_VISION_CAPABILITY)["provider"]
+
+
+def get_analysis_model():
+    return get_ai_configuration(AI_ANALYSIS_CAPABILITY)["model_name"]
+
+
+def get_analysis_provider():
+    return get_ai_configuration(AI_ANALYSIS_CAPABILITY)["provider"]
+
+
+def get_transcript_model():
+    return get_ai_configuration(AI_TRANSCRIPT_CAPABILITY)["model_name"]
+
+
+def get_transcript_provider():
+    return get_ai_configuration(AI_TRANSCRIPT_CAPABILITY)["provider"]
 
 
 def build_openrouter_headers(api_key):
@@ -734,6 +777,20 @@ def post_ai_chat(data, *, timeout, log_context, ai_config, max_attempts=None):
             ai_config=ai_config,
             max_attempts=max_attempts,
         )
+    if provider == "groq":
+        logger.error(
+            "Proveedor Groq no soportado para chat/completions en esta capacidad (%s)",
+            ai_config.get("capability"),
+        )
+        _record_brain_failure(
+            "unsupported_provider_for_chat",
+            log_context,
+            provider=provider,
+            capability=ai_config.get("capability"),
+            model=ai_config.get("model_name"),
+            transient=False,
+        )
+        return None
 
     return post_openrouter_chat(
         data,
@@ -1209,6 +1266,7 @@ Reglas:
         messages,
         timeout=OPENROUTER_VIDEO_TIMEOUT,
         log_context="video_summary",
+        capability=AI_ANALYSIS_CAPABILITY,
     )
     if content is None:
         return None
@@ -1260,6 +1318,7 @@ Reglas:
         timeout=OPENROUTER_REPO_TIMEOUT,
         max_tokens=REPO_PARTIAL_MAX_TOKENS,
         log_context=f"repo_chunk/{chunk_index}_{total_chunks}",
+        capability=AI_ANALYSIS_CAPABILITY,
     )
 
 
@@ -1309,4 +1368,5 @@ Reglas:
         timeout=OPENROUTER_REPO_TIMEOUT,
         max_tokens=REPO_SYNTHESIS_MAX_TOKENS,
         log_context="repo_synthesis",
+        capability=AI_ANALYSIS_CAPABILITY,
     )
