@@ -20,6 +20,10 @@ if ! command -v "$ngrok_bin" >/dev/null 2>&1; then
     exit 1
 fi
 
+# Matar instancias previas para liberar el endpoint en los servidores de ngrok
+pkill -f "$ngrok_bin" 2>/dev/null || true
+sleep 1
+
 args=(http "127.0.0.1:${port}" --url "$public_url")
 
 if [[ -n "${NGROK_AUTHTOKEN:-}" ]]; then
