@@ -13,7 +13,7 @@ import logging
 import json
 import base64
 from logging.handlers import RotatingFileHandler
-from datetime import datetime
+from datetime import datetime, timedelta
 from dateutil import rrule
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
@@ -81,6 +81,191 @@ AI_CAPABILITY_DESCRIPTIONS = {
     AI_TRANSCRIPT_CAPABILITY: 'Audio/video a texto',
 }
 DEFAULT_NVIDIA_TEXT_MODEL = os.getenv('NVIDIA_TEXT_MODEL_NAME', 'stepfun-ai/step-3.5-flash')
+LINK_REMINDER_CALLBACK_PREFIX = 'lrem:'
+PENDING_LINK_ACTIONS_KEY = 'pending_link_actions'
+LINK_REMINDER_FLOW_KEY = 'link_reminder_flow'
+LINK_ACTION_TTL_MINUTES = 60
+LINK_REMINDER_DATE_PAGE_SIZE = 14
+
+
+def get_bogota_tz():
+    return pytz.timezone('America/Bogota')
+
+
+def cleanup_expired_link_actions(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(get_bogota_tz())
+    expires_before = now - timedelta(minutes=LINK_ACTION_TTL_MINUTES)
+    pending_actions = context.user_data.setdefault(PENDING_LINK_ACTIONS_KEY, {})
+    reminder_flows = context.user_data.setdefault(LINK_REMINDER_FLOW_KEY, {})
+
+    for token, payload in list(pending_actions.items()):
+        created_at_raw = payload.get('created_at')
+        try:
+            created_at = datetime.fromisoformat(created_at_raw) if created_at_raw else None
+        except ValueError:
+            created_at = None
+
+        if created_at is None:
+            pending_actions.pop(token, None)
+            reminder_flows.pop(token, None)
+            continue
+
+        if created_at.tzinfo is None:
+            created_at = get_bogota_tz().localize(created_at)
+
+        if created_at <= expires_before:
+            pending_actions.pop(token, None)
+            reminder_flows.pop(token, None)
+
+
+def get_pending_link_actions(context: ContextTypes.DEFAULT_TYPE):
+    cleanup_expired_link_actions(context)
+    return context.user_data.setdefault(PENDING_LINK_ACTIONS_KEY, {})
+
+
+def get_link_reminder_flows(context: ContextTypes.DEFAULT_TYPE):
+    cleanup_expired_link_actions(context)
+    return context.user_data.setdefault(LINK_REMINDER_FLOW_KEY, {})
+
+
+def create_pending_link_action(context: ContextTypes.DEFAULT_TYPE, url: str, original_text: str = None):
+    token = uuid.uuid4().hex[:10]
+    actions = get_pending_link_actions(context)
+    actions[token] = {
+        'url': url,
+        'original_text': original_text or url,
+        'created_at': datetime.now(get_bogota_tz()).isoformat(),
+    }
+    return token
+
+
+def get_pending_link_action(context: ContextTypes.DEFAULT_TYPE, token: str):
+    return get_pending_link_actions(context).get(token)
+
+
+def clear_link_reminder_state(context: ContextTypes.DEFAULT_TYPE, token: str):
+    get_link_reminder_flows(context).pop(token, None)
+    get_pending_link_actions(context).pop(token, None)
+
+
+def format_link_reminder_date_label(target_date):
+    day_labels = {
+        0: 'Lun',
+        1: 'Mar',
+        2: 'Mié',
+        3: 'Jue',
+        4: 'Vie',
+        5: 'Sáb',
+        6: 'Dom',
+    }
+    return f"{day_labels[target_date.weekday()]} {target_date.strftime('%d/%m')}"
+
+
+def format_link_reminder_full_datetime(dt_obj: datetime):
+    day_labels = {
+        0: 'Lunes',
+        1: 'Martes',
+        2: 'Miércoles',
+        3: 'Jueves',
+        4: 'Viernes',
+        5: 'Sábado',
+        6: 'Domingo',
+    }
+    return f"{day_labels[dt_obj.weekday()]} {dt_obj.strftime('%Y-%m-%d %H:%M')}"
+
+
+def build_link_action_markup(token: str, analyze_button_text: str, analyze_callback_data: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(analyze_button_text, callback_data=analyze_callback_data)],
+        [InlineKeyboardButton("⏰ Recordatorio", callback_data=f"{LINK_REMINDER_CALLBACK_PREFIX}start:{token}")],
+    ])
+
+
+def build_link_reminder_date_markup(token: str, page: int = 0):
+    tz = get_bogota_tz()
+    today = datetime.now(tz).date()
+    start_offset = max(0, page) * LINK_REMINDER_DATE_PAGE_SIZE
+    buttons = []
+    rows = []
+
+    for offset in range(start_offset, start_offset + LINK_REMINDER_DATE_PAGE_SIZE):
+        current_date = today + timedelta(days=offset)
+        label = format_link_reminder_date_label(current_date)
+        if offset == 0:
+            label = f"Hoy · {label}"
+        elif offset == 1:
+            label = f"Mañana · {label}"
+
+        buttons.append(
+            InlineKeyboardButton(
+                label,
+                callback_data=f"{LINK_REMINDER_CALLBACK_PREFIX}date:{token}:{current_date.isoformat()}",
+            )
+        )
+
+    for index in range(0, len(buttons), 2):
+        rows.append(buttons[index:index + 2])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(
+            InlineKeyboardButton(
+                "⬅️ Fechas anteriores",
+                callback_data=f"{LINK_REMINDER_CALLBACK_PREFIX}dates:{token}:{page - 1}",
+            )
+        )
+    nav_row.append(
+        InlineKeyboardButton(
+            "➡️ Más fechas",
+            callback_data=f"{LINK_REMINDER_CALLBACK_PREFIX}dates:{token}:{page + 1}",
+        )
+    )
+    rows.append(nav_row)
+    rows.append([InlineKeyboardButton("❌ Cancelar", callback_data=f"{LINK_REMINDER_CALLBACK_PREFIX}cancel:{token}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_link_reminder_hour_markup(token: str):
+    rows = []
+    hours = [f"{hour:02d}" for hour in range(0, 24)]
+    buttons = [
+        InlineKeyboardButton(hour, callback_data=f"{LINK_REMINDER_CALLBACK_PREFIX}hour:{token}:{hour}")
+        for hour in hours
+    ]
+
+    for index in range(0, len(buttons), 4):
+        rows.append(buttons[index:index + 4])
+
+    rows.append([
+        InlineKeyboardButton("⬅️ Cambiar fecha", callback_data=f"{LINK_REMINDER_CALLBACK_PREFIX}backdate:{token}"),
+        InlineKeyboardButton("❌ Cancelar", callback_data=f"{LINK_REMINDER_CALLBACK_PREFIX}cancel:{token}"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_link_reminder_minute_markup(token: str):
+    minutes = ['00', '15', '30', '45']
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(minute, callback_data=f"{LINK_REMINDER_CALLBACK_PREFIX}minute:{token}:{minute}") for minute in minutes],
+        [
+            InlineKeyboardButton("⬅️ Cambiar hora", callback_data=f"{LINK_REMINDER_CALLBACK_PREFIX}backhour:{token}"),
+            InlineKeyboardButton("❌ Cancelar", callback_data=f"{LINK_REMINDER_CALLBACK_PREFIX}cancel:{token}"),
+        ],
+    ])
+
+
+def build_link_reminder_confirm_markup(token: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Guardar recordatorio", callback_data=f"{LINK_REMINDER_CALLBACK_PREFIX}confirm:{token}")],
+        [InlineKeyboardButton("⬅️ Cambiar hora", callback_data=f"{LINK_REMINDER_CALLBACK_PREFIX}backhour:{token}")],
+        [InlineKeyboardButton("❌ Cancelar", callback_data=f"{LINK_REMINDER_CALLBACK_PREFIX}cancel:{token}")],
+    ])
+
+
+def build_selected_link_reminder_datetime(flow: dict):
+    raw_value = f"{flow['selected_date']} {flow['selected_hour']}:{flow['selected_minute']}:00"
+    naive_dt = datetime.strptime(raw_value, REMINDER_DATETIME_FORMAT)
+    return get_bogota_tz().localize(naive_dt)
 
 
 def parse_bogota_datetime(datetime_str: str, tzinfo):
@@ -1435,6 +1620,236 @@ async def query_safe_edit_message(update: Update, context: ContextTypes.DEFAULT_
         )
 
 
+async def link_reminder_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    data = query.data or ''
+    parts = data.split(':')
+
+    if len(parts) < 3 or parts[0] != LINK_REMINDER_CALLBACK_PREFIX.rstrip(':'):
+        await query.answer("Acción no válida.", show_alert=True)
+        return
+
+    action = parts[1]
+    token = parts[2]
+    user_id = update.effective_user.id
+    pending = get_pending_link_action(context, token)
+    flows = get_link_reminder_flows(context)
+    flow = flows.get(token)
+
+    if action == 'cancel':
+        clear_link_reminder_state(context, token)
+        logging.info("link_reminder_cancelled user_id=%s token=%s", user_id, token)
+        await query_safe_edit_message(update, context, "❌ Recordatorio cancelado.")
+        return
+
+    if not pending:
+        logging.warning(
+            "link_reminder_expired_or_missing_token user_id=%s token=%s action=%s",
+            user_id,
+            token,
+            action,
+        )
+        await query_safe_edit_message(
+            update,
+            context,
+            "⚠️ Este flujo expiró. Envía el link nuevamente para crear el recordatorio.",
+        )
+        return
+
+    url = pending['url']
+
+    if action == 'start':
+        flows[token] = {
+            'url': url,
+            'selected_date': None,
+            'selected_hour': None,
+            'selected_minute': None,
+            'started_at': datetime.now(get_bogota_tz()).isoformat(),
+            'date_page': 0,
+        }
+        logging.info("link_reminder_flow_started user_id=%s token=%s url=%s", user_id, token, url)
+        await query_safe_edit_message(
+            update,
+            context,
+            f"¿Cuándo quieres que te recuerde revisar este link?\n\n🔗 {url}",
+            reply_markup=build_link_reminder_date_markup(token, page=0),
+        )
+        return
+
+    if action == 'dates':
+        page = 0
+        if len(parts) > 3:
+            try:
+                page = max(0, int(parts[3]))
+            except ValueError:
+                page = 0
+        if flow:
+            flow['date_page'] = page
+        await query_safe_edit_message(
+            update,
+            context,
+            f"Elige una fecha para revisar este link:\n\n🔗 {url}",
+            reply_markup=build_link_reminder_date_markup(token, page=page),
+        )
+        return
+
+    if not flow:
+        logging.warning("link_reminder_missing_flow user_id=%s token=%s action=%s", user_id, token, action)
+        await query_safe_edit_message(
+            update,
+            context,
+            "⚠️ Este flujo expiró. Envía el link nuevamente para crear el recordatorio.",
+        )
+        return
+
+    if action == 'date':
+        if len(parts) < 4:
+            await query.answer("Fecha inválida.", show_alert=True)
+            return
+        selected_date = parts[3]
+        flow['selected_date'] = selected_date
+        flow['selected_hour'] = None
+        flow['selected_minute'] = None
+        logging.info(
+            "link_reminder_date_selected user_id=%s token=%s date=%s",
+            user_id,
+            token,
+            selected_date,
+        )
+        await query_safe_edit_message(
+            update,
+            context,
+            f"Fecha seleccionada: {selected_date}\n\nAhora elige la hora:",
+            reply_markup=build_link_reminder_hour_markup(token),
+        )
+        return
+
+    if action == 'hour':
+        if len(parts) < 4:
+            await query.answer("Hora inválida.", show_alert=True)
+            return
+        selected_hour = parts[3]
+        flow['selected_hour'] = selected_hour
+        flow['selected_minute'] = None
+        logging.info(
+            "link_reminder_hour_selected user_id=%s token=%s hour=%s",
+            user_id,
+            token,
+            selected_hour,
+        )
+        await query_safe_edit_message(
+            update,
+            context,
+            f"Fecha: {flow['selected_date']}\nHora: {selected_hour}\n\nElige los minutos:",
+            reply_markup=build_link_reminder_minute_markup(token),
+        )
+        return
+
+    if action == 'minute':
+        if len(parts) < 4:
+            await query.answer("Minutos inválidos.", show_alert=True)
+            return
+        selected_minute = parts[3]
+        flow['selected_minute'] = selected_minute
+        selected_dt = build_selected_link_reminder_datetime(flow)
+        logging.info(
+            "link_reminder_minute_selected user_id=%s token=%s minute=%s candidate=%s",
+            user_id,
+            token,
+            selected_minute,
+            selected_dt.isoformat(),
+        )
+
+        if selected_dt <= datetime.now(get_bogota_tz()):
+            await query_safe_edit_message(
+                update,
+                context,
+                "⚠️ Esa fecha y hora ya pasaron. Elige otra hora.",
+                reply_markup=build_link_reminder_hour_markup(token),
+            )
+            return
+
+        await query_safe_edit_message(
+            update,
+            context,
+            (
+                "Confirma el recordatorio:\n\n"
+                f"🔗 Link:\n{url}\n\n"
+                f"🕒 Fecha y hora:\n{format_link_reminder_full_datetime(selected_dt)}"
+            ),
+            reply_markup=build_link_reminder_confirm_markup(token),
+        )
+        return
+
+    if action == 'backdate':
+        page = flow.get('date_page', 0)
+        await query_safe_edit_message(
+            update,
+            context,
+            f"Elige una fecha para revisar este link:\n\n🔗 {url}",
+            reply_markup=build_link_reminder_date_markup(token, page=page),
+        )
+        return
+
+    if action == 'backhour':
+        await query_safe_edit_message(
+            update,
+            context,
+            f"Fecha seleccionada: {flow.get('selected_date')}\n\nElige la hora:",
+            reply_markup=build_link_reminder_hour_markup(token),
+        )
+        return
+
+    if action == 'confirm':
+        if not flow.get('selected_date') or not flow.get('selected_hour') or not flow.get('selected_minute'):
+            await query_safe_edit_message(
+                update,
+                context,
+                "⚠️ Faltan datos del recordatorio. Envía el link nuevamente para reiniciar el flujo.",
+            )
+            clear_link_reminder_state(context, token)
+            return
+
+        selected_dt = build_selected_link_reminder_datetime(flow)
+        if selected_dt <= datetime.now(get_bogota_tz()):
+            await query_safe_edit_message(
+                update,
+                context,
+                "⚠️ Esa fecha y hora ya pasaron. Elige otra hora.",
+                reply_markup=build_link_reminder_hour_markup(token),
+            )
+            return
+
+        reminder_message = f"Revisar este enlace:\n{url}"
+        remind_at = selected_dt.strftime(REMINDER_DATETIME_FORMAT)
+        add_reminder(user_id, reminder_message, remind_at, recurrence=None)
+        logging.info(
+            "link_reminder_saved user_id=%s token=%s remind_at=%s url=%s",
+            user_id,
+            token,
+            remind_at,
+            url,
+        )
+        clear_link_reminder_state(context, token)
+
+        await query_safe_edit_message(
+            update,
+            context,
+            (
+                "✅ Recordatorio guardado.\n\n"
+                f"Te recordaré revisar este link el {format_link_reminder_full_datetime(selected_dt)}."
+            ),
+        )
+        return
+
+    await query.answer("Acción no reconocida.", show_alert=True)
+
+
 async def cancel_github_repository_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, analysis_id: str):
     state = get_active_repo_analyses(context.application).get(analysis_id)
     if not state:
@@ -1596,6 +2011,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.info(f"Enlace de YouTube detectado para usuario {user_id}: {youtube_url}")
 
             msg_id = update.message.message_id
+            reminder_token = create_pending_link_action(context, youtube_url, original_text=user_text)
             if 'youtube_urls' not in context.user_data:
                 context.user_data['youtube_urls'] = {}
             context.user_data['youtube_urls'][str(msg_id)] = {
@@ -1603,17 +2019,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'text': user_text,
             }
 
-            keyboard = [
-                [
-                    InlineKeyboardButton("🎬 Analizar Video", callback_data=f"yt_analyze:{msg_id}"),
-                    InlineKeyboardButton("⏰ Recordatorio", callback_data=f"yt_reminder:{msg_id}"),
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
             await update.message.reply_text(
                 "📺 Detecté un enlace de YouTube. ¿Qué deseas hacer?",
-                reply_markup=reply_markup,
+                reply_markup=build_link_action_markup(
+                    reminder_token,
+                    "🎬 Analizar Video",
+                    f"yt_analyze:{msg_id}",
+                ),
             )
             return
 
@@ -1622,6 +2034,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.info(f"Enlace de GitHub detectado para usuario {user_id}: {github_url}")
 
             msg_id = update.message.message_id
+            reminder_token = create_pending_link_action(context, github_url, original_text=user_text)
             if 'github_urls' not in context.user_data:
                 context.user_data['github_urls'] = {}
             context.user_data['github_urls'][str(msg_id)] = {
@@ -1629,17 +2042,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'text': user_text
             }
 
-            keyboard = [
-                [
-                    InlineKeyboardButton("🧠 Analizar repositorio", callback_data=f"gh_analyze:{msg_id}"),
-                    InlineKeyboardButton("⏰ Recordatorio", callback_data=f"gh_reminder:{msg_id}")
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
             await update.message.reply_text(
                 "🐙 He detectado un repositorio de GitHub. ¿Qué te gustaría hacer?",
-                reply_markup=reply_markup
+                reply_markup=build_link_action_markup(
+                    reminder_token,
+                    "🧠 Analizar repositorio",
+                    f"gh_analyze:{msg_id}",
+                )
             )
             return
 
@@ -1650,24 +2059,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Guardar la URL para usarla en el callback (callback_data tiene límite de 64 bytes)
             # Usamos un ID de mensaje o timestamp para evitar colisiones
             msg_id = update.message.message_id
+            reminder_token = create_pending_link_action(context, x_url, original_text=user_text)
             if 'x_urls' not in context.user_data:
                 context.user_data['x_urls'] = {}
             context.user_data['x_urls'][str(msg_id)] = {
                 'url': x_url,
                 'text': user_text
             }
-            
-            keyboard = [
-                [
-                    InlineKeyboardButton("🎬 Analizar Video", callback_data=f"x_video:{msg_id}"),
-                    InlineKeyboardButton("⏰ Recordatorio", callback_data=f"x_reminder:{msg_id}")
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
+
             await update.message.reply_text(
                 "🐦 He detectado un enlace de Twitter/X. ¿Qué te gustaría hacer?",
-                reply_markup=reply_markup
+                reply_markup=build_link_action_markup(
+                    reminder_token,
+                    "🎬 Analizar Video",
+                    f"x_video:{msg_id}",
+                )
             )
             return
 
@@ -2013,53 +2419,25 @@ async def x_link_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             await query.edit_message_text("⏳ Iniciando análisis del video...")
             await process_x_video(update, context, url, user_text)
         elif action == "x_reminder":
-            # Editar el mensaje para indicar que se está procesando el recordatorio
-            await query.edit_message_text("⏳ Preparando tu recordatorio...")
-            
-            # Enriquecer el texto para que la IA sepa que la intención es un recordatorio.
-            # Incluimos una instrucción más clara con contexto de fecha.
-            instruction = (
-                f"Quiero agendar un recordatorio para revisar este enlace: {url}. "
-                "Si no indico claramente cuándo, pregúntame para cuándo quiero el recordatorio."
-            )
-            
-            # Extraer texto adicional del usuario (sin la URL) para dar más contexto
-            extra_text = user_text.replace(url, '').strip()
-            if extra_text and len(extra_text) > 2:
-                instruction = f"Quiero agendar un recordatorio: {extra_text}. Enlace: {url}"
-            
-            await process_normal_message(update, context, instruction, user_id)
+            token = create_pending_link_action(context, url, original_text=user_text)
+            logging.info("legacy_link_reminder_redirect user_id=%s token=%s source=x url=%s", user_id, token, url)
+            query.data = f"{LINK_REMINDER_CALLBACK_PREFIX}start:{token}"
+            await link_reminder_callback_handler(update, context)
         elif action == "gh_analyze":
             await process_github_repository(update, context, url, user_text)
         elif action == "gh_reminder":
-            await query.edit_message_text("⏳ Preparando tu recordatorio...")
-
-            instruction = (
-                f"Quiero agendar un recordatorio para revisar este repositorio de GitHub: {url}. "
-                "Si no indico claramente cuándo, pregúntame para cuándo quiero el recordatorio."
-            )
-
-            extra_text = user_text.replace(url, '').strip()
-            if extra_text and len(extra_text) > 2:
-                instruction = f"Quiero agendar un recordatorio: {extra_text}. Repositorio GitHub: {url}"
-
-            await process_normal_message(update, context, instruction, user_id)
+            token = create_pending_link_action(context, url, original_text=user_text)
+            logging.info("legacy_link_reminder_redirect user_id=%s token=%s source=gh url=%s", user_id, token, url)
+            query.data = f"{LINK_REMINDER_CALLBACK_PREFIX}start:{token}"
+            await link_reminder_callback_handler(update, context)
         elif action == "yt_analyze":
             await query.edit_message_text("⏳ Iniciando análisis del video de YouTube...")
             await process_youtube_video(update, context, url, user_text)
         elif action == "yt_reminder":
-            await query.edit_message_text("⏳ Preparando tu recordatorio...")
-
-            instruction = (
-                f"Quiero agendar un recordatorio para revisar este video de YouTube: {url}. "
-                "Si no indico claramente cuándo, pregúntame para cuándo quiero el recordatorio."
-            )
-
-            extra_text = user_text.replace(url, '').strip()
-            if extra_text and len(extra_text) > 2:
-                instruction = f"Quiero agendar un recordatorio: {extra_text}. Video de YouTube: {url}"
-
-            await process_normal_message(update, context, instruction, user_id)
+            token = create_pending_link_action(context, url, original_text=user_text)
+            logging.info("legacy_link_reminder_redirect user_id=%s token=%s source=yt url=%s", user_id, token, url)
+            query.data = f"{LINK_REMINDER_CALLBACK_PREFIX}start:{token}"
+            await link_reminder_callback_handler(update, context)
     except Exception as e:
         logging.error(f"Error en x_link_callback_handler: {e}", exc_info=True)
         try:
@@ -2192,6 +2570,7 @@ if __name__ == '__main__':
         nota_photo_command
     ))
     application.add_handler(CallbackQueryHandler(ai_settings_callback_handler, pattern=r"^ai:"))
+    application.add_handler(CallbackQueryHandler(link_reminder_callback_handler, pattern=r"^lrem:"))
     application.add_handler(CallbackQueryHandler(x_link_callback_handler, pattern=r"^(x_|gh_|yt_)"))
     application.add_handler(MessageHandler(filters.VOICE & (~filters.COMMAND), handle_voice_message))
     application.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & (~filters.COMMAND), handle_message))
