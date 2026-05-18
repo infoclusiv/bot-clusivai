@@ -946,6 +946,9 @@ def process_user_input(text, history=None, active_reminders=None):
       "todos los domingos" -> "FREQ=WEEKLY;BYDAY=SU"
       "cada día a las 10am" -> "FREQ=DAILY"
       Si no es recurrente, pon "recurrence": null.
+    - Nunca crees una regla de recurrencia a menos que el usuario pida repetición explícitamente con palabras como "cada", "todos los", "diario", "semanal", "mensual", "repetir" o "recurrente".
+    - Si el usuario dice "mañana", "hoy", "el viernes" o una fecha/hora específica sin pedir repetición explícita, "recurrence" debe ser null.
+    - No infieras recurrencia a partir de fechas, días de la semana o texto encontrado dentro de una imagen.
     - Si quiere borrar un recordatorio, usa action: "DELETE" y en el campo "message" extrae SOLO el identificador (ID numérico o palabra clave principal), sin verbos como "borra", "quitar", "elimina", etc.
       Ejemplo: Si dice "Borra el recordatorio con ID 5" → "message": "5"
       Ejemplo: Si dice "Elimina la tarea de la leche" → "message": "leche"
@@ -1084,6 +1087,9 @@ def process_vision_input(text, image_base64, history=None, active_reminders=None
     - Si el usuario dice "recuérdame esto", "guarda esto", o algo similar, crea un recordatorio con action: "CREATE"
     - La descripción del recordatorio debe incluir lo que vez en la imagen (texto, información relevante, etc.)
     - Si el usuario pide el mismo recordatorio en varias horas, usa "reminders" con una entrada por cada hora; cada entrada debe tener su propia fecha/hora y la misma recurrencia si aplica.
+    - Nunca crees una regla de recurrencia a menos que el usuario pida repetición explícitamente con palabras como "cada", "todos los", "diario", "semanal", "mensual", "repetir" o "recurrente".
+    - Si el usuario dice "mañana", "hoy", "el viernes" o una fecha/hora específica sin pedir repetición explícita, "recurrence" debe ser null.
+    - No infieras recurrencia por días de la semana o texto visible dentro de la imagen si el usuario no pidió repetir.
     - Si no hay instrucción clara pero hay una imagen, pregunta al usuario qué quiere hacer con ella
     
     Ejemplos:

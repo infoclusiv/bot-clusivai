@@ -79,6 +79,14 @@ def normalize_note_subcategory_id(subcategory_id):
     return normalized
 
 
+def normalize_reminder_datetime(value):
+    """Normaliza datetimes de recordatorios al formato con espacio."""
+    if value is None:
+        return None
+
+    return str(value).replace("T", " ")
+
+
 def normalize_ai_capability(capability):
     """Normaliza una capacidad de IA soportada por el bot."""
     if capability is None:
@@ -332,17 +340,29 @@ def init_db():
     conn.close()
 
 def add_reminder(user_id, message, remind_at, recurrence=None, image_file_id=None):
+    remind_at = normalize_reminder_datetime(remind_at)
+
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('INSERT INTO reminders (user_id, message, remind_at, recurrence, image_file_id) VALUES (?, ?, ?, ?, ?)', 
                    (user_id, message, remind_at, recurrence, image_file_id))
+    reminder_id = cursor.lastrowid
     conn.commit()
     conn.close()
+    return reminder_id
 
 def get_user_reminders(user_id):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT id, message, remind_at, recurrence, image_file_id FROM reminders WHERE user_id = ? AND status = "pending"', (user_id,))
+    cursor.execute(
+        '''
+        SELECT id, message, remind_at, recurrence, image_file_id
+        FROM reminders
+        WHERE user_id = ? AND status = "pending"
+        ORDER BY datetime(replace(remind_at, 'T', ' ')) ASC, id ASC
+        ''',
+        (user_id,),
+    )
     rows = cursor.fetchall()
     conn.close()
     return rows
@@ -405,7 +425,7 @@ def update_reminder_by_id(user_id, reminder_id, new_message=None, new_date=None,
         params.append(new_message)
     if new_date is not None:
         updates.append("remind_at = ?")
-        params.append(new_date)
+        params.append(normalize_reminder_datetime(new_date))
         updates.append("status = 'pending'") # Reactivar si cambia la fecha
     if new_recurrence is not None:
         updates.append("recurrence = ?")

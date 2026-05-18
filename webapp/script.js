@@ -64,6 +64,18 @@ let currentSubcategoryName = null;
 let currentReminderId = reminderId;
 let currentRecurrence = initialRecurrence;
 let activeTab = 'calendar';
+
+function normalizeReminderDateForSort(value) {
+    if (!value) return 0;
+    return new Date(value.replace(' ', 'T')).getTime();
+}
+
+function extractReminderTime(value) {
+    if (!value) return '';
+    const normalized = value.replace('T', ' ');
+    const parts = normalized.split(' ');
+    return parts[1] ? parts[1].substring(0, 5) : '';
+}
 const uncategorizedLabel = 'Sin categoría';
 
 function formatLocalDate(date) {
@@ -247,7 +259,9 @@ function renderCalendar() {
             dayDiv.classList.add('today');
         }
 
-        const dayReminders = reminders.filter(r => r.date.startsWith(dateStr));
+        const dayReminders = reminders
+            .filter(r => r.date && r.date.slice(0, 10) === dateStr)
+            .sort((a, b) => normalizeReminderDateForSort(a.date) - normalizeReminderDateForSort(b.date));
         if (dayReminders.length > 0) {
             const dot = document.createElement('div');
             dot.classList.add('dot');
@@ -275,7 +289,7 @@ function selectDay(element, day, dateStr, dayReminders) {
             const item = document.createElement('div');
             item.classList.add('reminder-item');
 
-            const time = r.date.split(' ')[1].substring(0, 5);
+            const time = extractReminderTime(r.date);
 
             item.innerHTML = `
                 <div class="reminder-info">

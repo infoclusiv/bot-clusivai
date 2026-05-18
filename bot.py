@@ -338,6 +338,32 @@ def normalize_create_reminders(ai_result):
     return normalized
 
 
+def user_explicitly_requested_recurrence(text):
+    if not text:
+        return False
+
+    normalized = str(text).lower()
+    recurrence_markers = [
+        "cada ",
+        "todos los",
+        "todas las",
+        "diario",
+        "diariamente",
+        "semanal",
+        "semanalmente",
+        "mensual",
+        "mensualmente",
+        "repetir",
+        "recurrente",
+        "cada semana",
+        "cada mes",
+        "lunes a viernes",
+        "fines de semana",
+    ]
+
+    return any(marker in normalized for marker in recurrence_markers)
+
+
 def configure_logging():
     handlers = [logging.StreamHandler()]
     resolved_log_path = None
@@ -2197,6 +2223,19 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
         if action == "CREATE":
             reminders_to_create = normalize_create_reminders(res)
             reminders_to_create = [r for r in reminders_to_create if r.get("date")]
+            explicit_recurrence = user_explicitly_requested_recurrence(text_to_process)
+
+            logging.info(
+                "reminder.create.requested user_id=%s text=%r image=%s",
+                user_id,
+                text_to_process,
+                bool(context.user_data.get('pending_image_id')),
+            )
+            logging.info(
+                "reminder.create.parsed count=%s reminders=%s",
+                len(reminders_to_create),
+                reminders_to_create,
+            )
 
             # Validar que tengamos una fecha para el recordatorio
             if not reminders_to_create:
@@ -2209,16 +2248,39 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
             
             # Recuperar imagen pendiente (si existe)
             image_file_id = context.user_data.get('pending_image_id')
+            saved_reminders = []
             
             # Guardar recordatorio(s) con imagen
             for reminder in reminders_to_create:
-                add_reminder(
+                recurrence = reminder.get("recurrence")
+                if recurrence and not explicit_recurrence:
+                    logging.warning(
+                        "Clearing inferred recurrence because user did not explicitly request repetition. "
+                        "recurrence=%s text=%s",
+                        recurrence,
+                        text_to_process,
+                    )
+                    recurrence = None
+
+                logging.info(
+                    "reminder.create.validated recurrence=%s date=%s",
+                    recurrence,
+                    reminder.get("date"),
+                )
+                reminder_id = add_reminder(
                     user_id,
                     reminder["message"],
                     reminder["date"],
-                    reminder.get("recurrence"),
+                    recurrence,
                     image_file_id,
                 )
+                logging.info("reminder.create.db_insert.ok reminder_id=%s", reminder_id)
+                saved_reminders.append({
+                    "id": reminder_id,
+                    "message": reminder["message"],
+                    "date": reminder["date"],
+                    "recurrence": recurrence,
+                })
             
             # Limpiar imagen pendiente después de guardar todo el lote
             if 'pending_image_id' in context.user_data:
@@ -2228,8 +2290,8 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
             
             emoji = "🖼️" if image_file_id else "✅"
 
-            if len(reminders_to_create) == 1:
-                reminder = reminders_to_create[0]
+            if len(saved_reminders) == 1:
+                reminder = saved_reminders[0]
                 msg_recurrence = f"\n🔁 Recurrencia: {reminder.get('recurrence')}" if reminder.get("recurrence") else ""
                 fecha_formateada = format_reminder_date_for_reply(reminder["date"])
                 reply_message = (
@@ -2238,7 +2300,7 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
                 )
             else:
                 reminder_lines = []
-                for reminder in reminders_to_create:
+                for reminder in saved_reminders:
                     fecha_formateada = format_reminder_date_for_reply(reminder["date"])
                     recurrence_text = f"\n🔁 {reminder.get('recurrence')}" if reminder.get("recurrence") else ""
                     reminder_lines.append(
@@ -2246,7 +2308,7 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
                     )
 
                 reply_message = (
-                    f"{emoji} ¡Perfecto! He guardado {len(reminders_to_create)} recordatorios:\n\n"
+                    f"{emoji} ¡Perfecto! He guardado {len(saved_reminders)} recordatorios:\n\n"
                     + "\n\n".join(reminder_lines)
                 )
             
