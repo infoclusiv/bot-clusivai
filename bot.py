@@ -86,6 +86,11 @@ PENDING_LINK_ACTIONS_KEY = 'pending_link_actions'
 LINK_REMINDER_FLOW_KEY = 'link_reminder_flow'
 LINK_ACTION_TTL_MINUTES = 60
 LINK_REMINDER_DATE_PAGE_SIZE = 14
+REMINDER_CALLBACK_PREFIX = 'rem:'
+PENDING_REMINDER_ITEMS_KEY = 'pending_reminder_items'
+REMINDER_FLOW_KEY = 'reminder_flow'
+REMINDER_ACTION_TTL_MINUTES = LINK_ACTION_TTL_MINUTES
+REMINDER_DATE_PAGE_SIZE = LINK_REMINDER_DATE_PAGE_SIZE
 
 
 def get_bogota_tz():
@@ -148,6 +153,68 @@ def clear_link_reminder_state(context: ContextTypes.DEFAULT_TYPE, token: str):
     get_pending_link_actions(context).pop(token, None)
 
 
+def cleanup_expired_reminder_items(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(get_bogota_tz())
+    expires_before = now - timedelta(minutes=REMINDER_ACTION_TTL_MINUTES)
+    pending_items = context.user_data.setdefault(PENDING_REMINDER_ITEMS_KEY, {})
+    reminder_flows = context.user_data.setdefault(REMINDER_FLOW_KEY, {})
+
+    for token, payload in list(pending_items.items()):
+        created_at_raw = payload.get('created_at')
+        try:
+            created_at = datetime.fromisoformat(created_at_raw) if created_at_raw else None
+        except ValueError:
+            created_at = None
+
+        if created_at is None:
+            pending_items.pop(token, None)
+            reminder_flows.pop(token, None)
+            continue
+
+        if created_at.tzinfo is None:
+            created_at = get_bogota_tz().localize(created_at)
+
+        if created_at <= expires_before:
+            pending_items.pop(token, None)
+            reminder_flows.pop(token, None)
+
+
+def get_pending_reminder_items(context: ContextTypes.DEFAULT_TYPE):
+    cleanup_expired_reminder_items(context)
+    return context.user_data.setdefault(PENDING_REMINDER_ITEMS_KEY, {})
+
+
+def get_reminder_flows(context: ContextTypes.DEFAULT_TYPE):
+    cleanup_expired_reminder_items(context)
+    return context.user_data.setdefault(REMINDER_FLOW_KEY, {})
+
+
+def create_pending_reminder_item(
+    context: ContextTypes.DEFAULT_TYPE,
+    item_type: str,
+    message: str,
+    metadata: dict | None = None,
+):
+    token = uuid.uuid4().hex[:10]
+    items = get_pending_reminder_items(context)
+    items[token] = {
+        'type': item_type,
+        'message': (message or '').strip() or 'Recordatorio con imagen',
+        'created_at': datetime.now(get_bogota_tz()).isoformat(),
+        'metadata': metadata or {},
+    }
+    return token
+
+
+def get_pending_reminder_item(context: ContextTypes.DEFAULT_TYPE, token: str):
+    return get_pending_reminder_items(context).get(token)
+
+
+def clear_reminder_state(context: ContextTypes.DEFAULT_TYPE, token: str):
+    get_reminder_flows(context).pop(token, None)
+    get_pending_reminder_items(context).pop(token, None)
+
+
 def format_link_reminder_date_label(target_date):
     day_labels = {
         0: 'Lun',
@@ -174,11 +241,114 @@ def format_link_reminder_full_datetime(dt_obj: datetime):
     return f"{day_labels[dt_obj.weekday()]} {dt_obj.strftime('%Y-%m-%d %H:%M')}"
 
 
+def format_reminder_source_label(item: dict) -> str:
+    item_type = item.get('type')
+    if item_type == 'image':
+        return 'esta imagen'
+    if item_type == 'link':
+        return 'este enlace'
+    return 'esto'
+
+
 def build_link_action_markup(token: str, analyze_button_text: str, analyze_callback_data: str):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(analyze_button_text, callback_data=analyze_callback_data)],
         [InlineKeyboardButton("⏰ Recordatorio", callback_data=f"{LINK_REMINDER_CALLBACK_PREFIX}start:{token}")],
     ])
+
+
+def build_reminder_start_markup(token: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏰ Crear recordatorio", callback_data=f"{REMINDER_CALLBACK_PREFIX}start:{token}")],
+        [InlineKeyboardButton("❌ Cancelar", callback_data=f"{REMINDER_CALLBACK_PREFIX}cancel:{token}")],
+    ])
+
+
+def build_reminder_date_markup(token: str, page: int = 0):
+    tz = get_bogota_tz()
+    today = datetime.now(tz).date()
+    start_offset = max(0, page) * REMINDER_DATE_PAGE_SIZE
+    buttons = []
+    rows = []
+
+    for offset in range(start_offset, start_offset + REMINDER_DATE_PAGE_SIZE):
+        current_date = today + timedelta(days=offset)
+        label = format_link_reminder_date_label(current_date)
+        if offset == 0:
+            label = f"Hoy · {label}"
+        elif offset == 1:
+            label = f"Mañana · {label}"
+
+        buttons.append(
+            InlineKeyboardButton(
+                label,
+                callback_data=f"{REMINDER_CALLBACK_PREFIX}date:{token}:{current_date.isoformat()}",
+            )
+        )
+
+    for index in range(0, len(buttons), 2):
+        rows.append(buttons[index:index + 2])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(
+            InlineKeyboardButton(
+                "⬅️ Fechas anteriores",
+                callback_data=f"{REMINDER_CALLBACK_PREFIX}dates:{token}:{page - 1}",
+            )
+        )
+    nav_row.append(
+        InlineKeyboardButton(
+            "➡️ Más fechas",
+            callback_data=f"{REMINDER_CALLBACK_PREFIX}dates:{token}:{page + 1}",
+        )
+    )
+    rows.append(nav_row)
+    rows.append([InlineKeyboardButton("❌ Cancelar", callback_data=f"{REMINDER_CALLBACK_PREFIX}cancel:{token}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_reminder_hour_markup(token: str):
+    rows = []
+    hours = [f"{hour:02d}" for hour in range(0, 24)]
+    buttons = [
+        InlineKeyboardButton(hour, callback_data=f"{REMINDER_CALLBACK_PREFIX}hour:{token}:{hour}")
+        for hour in hours
+    ]
+
+    for index in range(0, len(buttons), 4):
+        rows.append(buttons[index:index + 4])
+
+    rows.append([
+        InlineKeyboardButton("⬅️ Cambiar fecha", callback_data=f"{REMINDER_CALLBACK_PREFIX}backdate:{token}"),
+        InlineKeyboardButton("❌ Cancelar", callback_data=f"{REMINDER_CALLBACK_PREFIX}cancel:{token}"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_reminder_minute_markup(token: str):
+    minutes = ['00', '15', '30', '45']
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(minute, callback_data=f"{REMINDER_CALLBACK_PREFIX}minute:{token}:{minute}") for minute in minutes],
+        [
+            InlineKeyboardButton("⬅️ Cambiar hora", callback_data=f"{REMINDER_CALLBACK_PREFIX}backhour:{token}"),
+            InlineKeyboardButton("❌ Cancelar", callback_data=f"{REMINDER_CALLBACK_PREFIX}cancel:{token}"),
+        ],
+    ])
+
+
+def build_reminder_confirm_markup(token: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Guardar recordatorio", callback_data=f"{REMINDER_CALLBACK_PREFIX}confirm:{token}")],
+        [InlineKeyboardButton("⬅️ Cambiar hora", callback_data=f"{REMINDER_CALLBACK_PREFIX}backhour:{token}")],
+        [InlineKeyboardButton("❌ Cancelar", callback_data=f"{REMINDER_CALLBACK_PREFIX}cancel:{token}")],
+    ])
+
+
+def build_selected_reminder_datetime(flow: dict):
+    raw_value = f"{flow['selected_date']} {flow['selected_hour']}:{flow['selected_minute']}:00"
+    naive_dt = datetime.strptime(raw_value, REMINDER_DATETIME_FORMAT)
+    return get_bogota_tz().localize(naive_dt)
 
 
 def build_link_reminder_date_markup(token: str, page: int = 0):
@@ -1876,6 +2046,239 @@ async def link_reminder_callback_handler(update: Update, context: ContextTypes.D
     await query.answer("Acción no reconocida.", show_alert=True)
 
 
+async def reminder_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    data = query.data or ''
+    parts = data.split(':')
+
+    if len(parts) < 3 or parts[0] != REMINDER_CALLBACK_PREFIX.rstrip(':'):
+        await query.answer("Acción no válida.", show_alert=True)
+        return
+
+    action = parts[1]
+    token = parts[2]
+    user_id = update.effective_user.id
+    pending_item = get_pending_reminder_item(context, token)
+    flows = get_reminder_flows(context)
+    flow = flows.get(token)
+
+    if action == 'cancel':
+        clear_reminder_state(context, token)
+        logging.info("reminder_cancelled user_id=%s token=%s", user_id, token)
+        await query_safe_edit_message(update, context, "❌ Recordatorio cancelado.")
+        return
+
+    if not pending_item:
+        logging.warning(
+            "reminder_expired_or_missing_token user_id=%s token=%s action=%s",
+            user_id,
+            token,
+            action,
+        )
+        await query_safe_edit_message(
+            update,
+            context,
+            "⚠️ Este flujo expiró. Envía la imagen nuevamente para crear el recordatorio.",
+        )
+        return
+
+    item_type = pending_item.get('type')
+    item_message = pending_item.get('message') or 'Recordatorio con imagen'
+    source_label = format_reminder_source_label(pending_item)
+
+    if action == 'start':
+        flows[token] = {
+            'item_type': item_type,
+            'selected_date': None,
+            'selected_hour': None,
+            'selected_minute': None,
+            'started_at': datetime.now(get_bogota_tz()).isoformat(),
+            'date_page': 0,
+        }
+        logging.info("reminder_flow_started user_id=%s token=%s type=%s", user_id, token, item_type)
+        await query_safe_edit_message(
+            update,
+            context,
+            f"¿Cuándo quieres que te recuerde {source_label}?",
+            reply_markup=build_reminder_date_markup(token, page=0),
+        )
+        return
+
+    if action == 'dates':
+        page = 0
+        if len(parts) > 3:
+            try:
+                page = max(0, int(parts[3]))
+            except ValueError:
+                page = 0
+        if flow:
+            flow['date_page'] = page
+        await query_safe_edit_message(
+            update,
+            context,
+            f"Elige una fecha para recordar {source_label}:",
+            reply_markup=build_reminder_date_markup(token, page=page),
+        )
+        return
+
+    if not flow:
+        logging.warning("reminder_missing_flow user_id=%s token=%s action=%s", user_id, token, action)
+        await query_safe_edit_message(
+            update,
+            context,
+            "⚠️ Este flujo expiró. Envía la imagen nuevamente para crear el recordatorio.",
+        )
+        return
+
+    if action == 'date':
+        if len(parts) < 4:
+            await query.answer("Fecha inválida.", show_alert=True)
+            return
+        selected_date = parts[3]
+        flow['selected_date'] = selected_date
+        flow['selected_hour'] = None
+        flow['selected_minute'] = None
+        logging.info("reminder_date_selected user_id=%s token=%s date=%s", user_id, token, selected_date)
+        await query_safe_edit_message(
+            update,
+            context,
+            f"Fecha seleccionada: {selected_date}\n\nAhora elige la hora:",
+            reply_markup=build_reminder_hour_markup(token),
+        )
+        return
+
+    if action == 'hour':
+        if len(parts) < 4:
+            await query.answer("Hora inválida.", show_alert=True)
+            return
+        selected_hour = parts[3]
+        flow['selected_hour'] = selected_hour
+        flow['selected_minute'] = None
+        logging.info("reminder_hour_selected user_id=%s token=%s hour=%s", user_id, token, selected_hour)
+        await query_safe_edit_message(
+            update,
+            context,
+            f"Fecha: {flow['selected_date']}\nHora: {selected_hour}\n\nElige los minutos:",
+            reply_markup=build_reminder_minute_markup(token),
+        )
+        return
+
+    if action == 'minute':
+        if len(parts) < 4:
+            await query.answer("Minutos inválidos.", show_alert=True)
+            return
+        selected_minute = parts[3]
+        flow['selected_minute'] = selected_minute
+        selected_dt = build_selected_reminder_datetime(flow)
+        logging.info(
+            "reminder_minute_selected user_id=%s token=%s minute=%s candidate=%s",
+            user_id,
+            token,
+            selected_minute,
+            selected_dt.isoformat(),
+        )
+
+        if selected_dt <= datetime.now(get_bogota_tz()):
+            await query_safe_edit_message(
+                update,
+                context,
+                "⚠️ Esa fecha y hora ya pasaron. Elige otra hora.",
+                reply_markup=build_reminder_hour_markup(token),
+            )
+            return
+
+        await query_safe_edit_message(
+            update,
+            context,
+            (
+                "Confirma el recordatorio:\n\n"
+                f"🖼️ {item_message}\n\n"
+                f"🕒 Fecha y hora:\n{format_link_reminder_full_datetime(selected_dt)}"
+            ),
+            reply_markup=build_reminder_confirm_markup(token),
+        )
+        return
+
+    if action == 'backdate':
+        page = flow.get('date_page', 0)
+        await query_safe_edit_message(
+            update,
+            context,
+            f"Elige una fecha para recordar {source_label}:",
+            reply_markup=build_reminder_date_markup(token, page=page),
+        )
+        return
+
+    if action == 'backhour':
+        await query_safe_edit_message(
+            update,
+            context,
+            f"Fecha seleccionada: {flow.get('selected_date')}\n\nElige la hora:",
+            reply_markup=build_reminder_hour_markup(token),
+        )
+        return
+
+    if action == 'confirm':
+        if not flow.get('selected_date') or not flow.get('selected_hour') or not flow.get('selected_minute'):
+            await query_safe_edit_message(
+                update,
+                context,
+                "⚠️ Faltan datos del recordatorio. Envía la imagen nuevamente para reiniciar el flujo.",
+            )
+            clear_reminder_state(context, token)
+            return
+
+        selected_dt = build_selected_reminder_datetime(flow)
+        if selected_dt <= datetime.now(get_bogota_tz()):
+            await query_safe_edit_message(
+                update,
+                context,
+                "⚠️ Esa fecha y hora ya pasaron. Elige otra hora.",
+                reply_markup=build_reminder_hour_markup(token),
+            )
+            return
+
+        metadata = pending_item.get('metadata') or {}
+        image_file_id = metadata.get('image_file_id') if item_type == 'image' else None
+        if item_type == 'image' and not image_file_id:
+            logging.warning("image_reminder_missing_image_file user_id=%s token=%s", user_id, token)
+
+        remind_at = selected_dt.strftime(REMINDER_DATETIME_FORMAT)
+        reminder_id = add_reminder(
+            user_id,
+            item_message,
+            remind_at,
+            recurrence=None,
+            image_file_id=image_file_id,
+        )
+        logging.info(
+            "reminder_saved user_id=%s token=%s type=%s reminder_id=%s remind_at=%s image=%s",
+            user_id,
+            token,
+            item_type,
+            reminder_id,
+            remind_at,
+            bool(image_file_id),
+        )
+        clear_reminder_state(context, token)
+        await query_safe_edit_message(
+            update,
+            context,
+            (
+                "✅ Recordatorio guardado.\n\n"
+                f"Te recordaré esto el {format_link_reminder_full_datetime(selected_dt)}."
+            ),
+        )
+        return
+
+    await query.answer("Acción no reconocida.", show_alert=True)
+
+
 async def cancel_github_repository_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, analysis_id: str):
     state = get_active_repo_analyses(context.application).get(analysis_id)
     if not state:
@@ -2105,6 +2508,59 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await process_normal_message(update, context, user_text, user_id)
 
+
+def extract_image_file_data(msg):
+    if msg.photo:
+        return msg.photo[-1].file_id, 'image/jpeg'
+    if msg.document and msg.document.mime_type and msg.document.mime_type.startswith('image/'):
+        return msg.document.file_id, msg.document.mime_type or 'image/jpeg'
+    return None, None
+
+
+async def handle_image_reminder_entrypoint(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_text: str | None,
+    user_id: int,
+):
+    msg = update.effective_message
+    image_file_id, image_mime_type = extract_image_file_data(msg)
+
+    if not image_file_id:
+        return False
+
+    context.user_data.pop('pending_image_id', None)
+    context.user_data.pop('pending_image_mime_type', None)
+
+    caption = (user_text or "").strip()
+    reminder_message = caption if caption else "Recordatorio con imagen"
+
+    token = create_pending_reminder_item(
+        context,
+        item_type="image",
+        message=reminder_message,
+        metadata={
+            "image_file_id": image_file_id,
+            "image_mime_type": image_mime_type or "image/jpeg",
+        },
+    )
+
+    logging.info(
+        "image_reminder_entrypoint user_id=%s token=%s has_caption=%s image_file_id=%s",
+        user_id,
+        token,
+        bool(caption),
+        image_file_id,
+    )
+
+    preview_line = f": {caption}" if caption else ""
+    await msg.reply_text(
+        f"📸 Imagen recibida{preview_line}\n\n¿Qué deseas hacer?",
+        reply_markup=build_reminder_start_markup(token),
+    )
+    return True
+
+
 async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str, user_id: int):
     """Procesamiento normal de mensajes (IA, recordatorios, notas, etc.)"""
     
@@ -2116,30 +2572,15 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
         # Si no hay texto ni imagen, salir
         return
     
-    # 1. CAPTURA DE IMAGEN: Guardar el file_id sin enviar a IA
     if has_image:
-        # Obtener el file_id de la foto (tomamos la de mayor resolución)
-        if msg.photo:
-            photo_id = msg.photo[-1].file_id
-            image_mime_type = 'image/jpeg'
-        else:
-            photo_id = msg.document.file_id
-            image_mime_type = msg.document.mime_type or 'image/jpeg'
-        
-        context.user_data['pending_image_id'] = photo_id
-        context.user_data['pending_image_mime_type'] = image_mime_type
-        logging.info(f"Imagen recibida para usuario {user_id}: {photo_id}")
-        
-        # Si no hay caption de texto, solicitar que escriba qué quiere hacer
-        if not user_text:
-            await msg.reply_text("📸 Imagen recibida y guardada. Ahora escríbeme qué quieres hacer con ella.\n\nEjemplo: 'Recuérdame esto mañana a las 8am'")
+        handled = await handle_image_reminder_entrypoint(update, context, user_text, user_id)
+        if handled:
             return
-    
-    # 2. RECUPERAR IMAGE_ID PENDIENTE (si existe de un mensaje anterior)
-    image_to_save = context.user_data.get('pending_image_id')
-    image_mime_type = context.user_data.get('pending_image_mime_type') or 'image/jpeg'
-    
-    logging.info(f"Mensaje recibido de usuario {user_id}: {user_text} (con imagen_id: {bool(image_to_save)})")
+
+    context.user_data.pop('pending_image_id', None)
+    context.user_data.pop('pending_image_mime_type', None)
+
+    logging.info(f"Mensaje recibido de usuario {user_id}: {user_text} (con imagen_id: False)")
     
     # Usar el chat efectivo para acciones que no dependen de un mensaje específico
     chat = update.effective_chat
@@ -2157,34 +2598,11 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
     # Obtener recordatorios activos para contexto
     active_reminders = get_user_reminders(user_id)
     
-    # 3. PROCESAR TEXTO (si hay imagen pendiente, enriquecer el texto para que la IA lo sepa)
+    # 3. PROCESAR TEXTO
     text_to_process = user_text
-    if image_to_save:
-        text_to_process = f"{user_text}\n[📸 El usuario adjuntó una imagen a este mensaje]"
     
     try:
-        if image_to_save:
-            image_base64 = await download_telegram_file_to_base64(
-                context.bot,
-                image_to_save,
-                mime_type=image_mime_type,
-            )
-            if image_base64:
-                res = process_vision_input(
-                    text_to_process,
-                    image_base64,
-                    history=history,
-                    active_reminders=active_reminders,
-                )
-            else:
-                logging.warning(
-                    "No se pudo descargar la imagen pendiente %s para el usuario %s; usando fallback de texto",
-                    image_to_save,
-                    user_id,
-                )
-                res = process_user_input(text_to_process, history=history, active_reminders=active_reminders)
-        else:
-            res = process_user_input(text_to_process, history=history, active_reminders=active_reminders)
+        res = process_user_input(text_to_process, history=history, active_reminders=active_reminders)
         
         if not res:
             failure = get_last_brain_failure()
@@ -2229,7 +2647,7 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
                 "reminder.create.requested user_id=%s text=%r image=%s",
                 user_id,
                 text_to_process,
-                bool(context.user_data.get('pending_image_id')),
+                False,
             )
             logging.info(
                 "reminder.create.parsed count=%s reminders=%s",
@@ -2246,11 +2664,9 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
                 )
                 return
             
-            # Recuperar imagen pendiente (si existe)
-            image_file_id = context.user_data.get('pending_image_id')
             saved_reminders = []
             
-            # Guardar recordatorio(s) con imagen
+            # Guardar recordatorio(s)
             for reminder in reminders_to_create:
                 recurrence = reminder.get("recurrence")
                 if recurrence and not explicit_recurrence:
@@ -2272,7 +2688,7 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
                     reminder["message"],
                     reminder["date"],
                     recurrence,
-                    image_file_id,
+                    None,
                 )
                 logging.info("reminder.create.db_insert.ok reminder_id=%s", reminder_id)
                 saved_reminders.append({
@@ -2282,13 +2698,7 @@ async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_T
                     "recurrence": recurrence,
                 })
             
-            # Limpiar imagen pendiente después de guardar todo el lote
-            if 'pending_image_id' in context.user_data:
-                del context.user_data['pending_image_id']
-            if 'pending_image_mime_type' in context.user_data:
-                del context.user_data['pending_image_mime_type']
-            
-            emoji = "🖼️" if image_file_id else "✅"
+            emoji = "✅"
 
             if len(saved_reminders) == 1:
                 reminder = saved_reminders[0]
@@ -2633,6 +3043,7 @@ if __name__ == '__main__':
     ))
     application.add_handler(CallbackQueryHandler(ai_settings_callback_handler, pattern=r"^ai:"))
     application.add_handler(CallbackQueryHandler(link_reminder_callback_handler, pattern=r"^lrem:"))
+    application.add_handler(CallbackQueryHandler(reminder_callback_handler, pattern=r"^rem:"))
     application.add_handler(CallbackQueryHandler(x_link_callback_handler, pattern=r"^(x_|gh_|yt_)"))
     application.add_handler(MessageHandler(filters.VOICE & (~filters.COMMAND), handle_voice_message))
     application.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & (~filters.COMMAND), handle_message))
